@@ -35,7 +35,6 @@ def watch_file(x: np.ndarray) -> str:
 def api(tmp_path, monkeypatch):
     monkeypatch.setenv("LEZEPPLEAN_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("LEZEPPLEAN_CAPTURES", str(tmp_path / "captures"))
-    monkeypatch.setenv("LEZEPPLEAN_WARM", "0")
     monkeypatch.delenv("LEZEPPLEAN_TOKEN", raising=False)
     from lezepplean import app as app_module
     app_module = importlib.reload(app_module)

@@ -79,7 +79,6 @@ The other endpoints:
 | `LEZEPPLEAN_CAPTURES` | `captures/` | where requests are saved |
 | `LEZEPPLEAN_KEEP_CAPTURES` | `50` | how many; `0` saves none |
 | `LEZEPPLEAN_CAPTURE_AUDIO` | `1` | `0` keeps only the JSON summaries (the audio is the user's room) |
-| `LEZEPPLEAN_WARM` | `1` | load the models at startup |
 
 ## Deploying
 

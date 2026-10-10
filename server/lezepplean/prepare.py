@@ -41,6 +41,10 @@ SECONDS_PER_SONG_SECOND = 0.2
 RETRY_FIRST_S = 300
 RETRY_MAX_S = 6 * 3600
 RETRY_ABSENT_S = 7 * 24 * 3600
+# The worker holds both models (~340 MB) while it lives. It starts when a new song's
+# audio starts downloading, so the models load in the seconds the download takes anyway,
+# and it is let go after this long with nothing to do: idle, the server is ~130 MB.
+IDLE_RELEASE_S = 300
 # A step that fails (or is cut short: the process died) waits before it runs again: 1 min,
 # 4, 16, ... 6 h. Saved with the song, so a step that kills the server isn't re-run on every
 # request, nor at once after each restart.
@@ -70,6 +74,7 @@ class Preparer:
         self._fetching: dict[str, asyncio.Task] = {}
         self._queued: set[tuple[str, str]] = set()
         self._consumer: asyncio.Task | None = None
+        self._idle: asyncio.TimerHandle | None = None
         self.busy: str | None = None
 
     # ---- what the API calls ---------------------------------------------------------
@@ -80,6 +85,7 @@ class Preparer:
             self._consumer = asyncio.get_running_loop().create_task(self._consume())
         due = time.time() >= (song.reference_retry_at or 0)
         if song.reference_status in ("pending", "unavailable") and due and song.id not in self._fetching:
+            self._warm()  # CPU work follows the download: start the worker now, in parallel
             task = asyncio.get_running_loop().create_task(self._reference(song.id, position_ms))
             self._fetching[song.id] = task
             task.add_done_callback(lambda _t, sid=song.id: self._fetching.pop(sid, None))
@@ -240,6 +246,7 @@ class Preparer:
             finally:
                 self._queued.discard((job.song_id, job.kind))
                 self.busy = None
+                self._touch()
 
     def _note(self, job: Job, what: str) -> None:
         # The song stays "pending": never saved as word-less because of the server's own trouble.
@@ -305,9 +312,23 @@ class Preparer:
         self.store.put(song)
         log.info("%s words for %s: %d lines in %.1fs (model %.1fs)", job.kind, song.id, len(out["lines"]), out["seconds"], out["modelSeconds"])
 
-    def warm(self) -> None:
-        """Start the worker and load its models now, in the background."""
-        self._pool().submit(worker.warm)
+    def _warm(self) -> None:
+        self._touch()
+        if self._executor is None:
+            self._pool().submit(worker.warm)
+
+    def _touch(self) -> None:
+        if self._idle is not None:
+            self._idle.cancel()
+        self._idle = asyncio.get_running_loop().call_later(IDLE_RELEASE_S, self._release_if_idle)
+
+    def _release_if_idle(self) -> None:
+        if self._queue or self.busy or self._fetching:
+            self._touch()  # still working: look again later
+        elif self._executor is not None:
+            log.info("worker idle for %ds: releasing it and its models", IDLE_RELEASE_S)
+            self._executor.shutdown(wait=False)
+            self._executor = None
 
     def close(self) -> None:
         if self._executor is not None:
