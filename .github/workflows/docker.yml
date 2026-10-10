@@ -2,13 +2,15 @@ name: Build and Push Docker Image + Helm Chart
 
 # The server's image and its Helm chart, as texas-fold-em does it. A v* tag publishes
 # both at exactly Chart.yaml's version (what homelab.setup pins); a push to main
-# publishes a traceable <version>+<sha> chart and the image's branch/sha tags.
-# The watch app is not built here: it is installed from a Mac (tools/install-watch.sh).
+# publishes a traceable <version>+<sha> chart and the image's branch/sha tags. A pull
+# request only runs the tests. The watch app is not built here: it is installed from a
+# Mac (tools/install-watch.sh).
 
 on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
 
 env:
   REGISTRY: ghcr.io
@@ -17,6 +19,7 @@ env:
 jobs:
   build-and-push:
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
