@@ -22,8 +22,11 @@ COPY lezepplean ./lezepplean
 RUN useradd --create-home --uid 1000 lzl && mkdir -p /data && chown lzl /data
 USER lzl
 
+# What /health reports: the release tag, passed in by CI.
+ARG VERSION=dev
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
+    LEZEPPLEAN_VERSION=$VERSION \
     LEZEPPLEAN_DATA=/data \
     LEZEPPLEAN_MODELS=/data/models \
     LEZEPPLEAN_CAPTURES=/data/captures \

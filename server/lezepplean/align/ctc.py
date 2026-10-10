@@ -64,6 +64,23 @@ def ensure_model(directory: Path | None = None) -> Path:
     return directory
 
 
+_exact_pool = False
+
+
+def _use_exact_pool(ort, options) -> None:
+    """ONNX Runtime's default memory pool grows by doubling and keeps everything. Fed chunks
+    of varying length, it ended one song 1.2 GB bigger, which with the separator ran the
+    worker out of memory. Sized exactly and emptied after each run, it keeps nothing
+    between chunks, for ~8% more time. (The separator keeps the default: its blocks are
+    all one size, so its pool stops at ~300 MB, and this would cost it 20%.)"""
+    global _exact_pool
+    if not _exact_pool:  # one per process
+        info = ort.OrtMemoryInfo("Cpu", ort.OrtAllocatorType.ORT_ARENA_ALLOCATOR, 0, ort.OrtMemType.DEFAULT)
+        ort.create_and_register_allocator(info, ort.OrtArenaCfg({"arena_extend_strategy": 1}))  # kSameAsRequested
+        _exact_pool = True
+    options.add_session_config_entry("session.use_env_allocators", "1")
+
+
 class CtcModel:
     def __init__(self, directory: Path | None = None, threads: int = 2):
         import onnxruntime as ort
@@ -73,8 +90,11 @@ class CtcModel:
         options.intra_op_num_threads = threads
         options.inter_op_num_threads = 1
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        _use_exact_pool(ort, options)
         model = directory / Path(DEFAULT_FILES["model"]).name
         self._session = ort.InferenceSession(str(model), options, providers=["CPUExecutionProvider"])
+        self._run = ort.RunOptions()
+        self._run.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
         self._input = self._session.get_inputs()[0].name
         vocab: dict[str, int] = json.loads((directory / "vocab.json").read_text())
         self.blank = vocab["<pad>"]
@@ -101,7 +121,7 @@ class CtcModel:
             b = min(total, f1 + context)
             piece = audio[a * HOP: (b - 1) * HOP + RECEPTIVE].astype(np.float32)
             piece = (piece - piece.mean()) / np.sqrt(piece.var() + 1e-7)
-            logits = self._session.run(None, {self._input: piece[None, :]})[0][0]
+            logits = self._session.run(None, {self._input: piece[None, :]}, self._run)[0][0]
             if out is None:
                 out = np.empty((total, logits.shape[1]), dtype=np.float32)
             got = logits[f0 - a: f0 - a + (f1 - f0)]
