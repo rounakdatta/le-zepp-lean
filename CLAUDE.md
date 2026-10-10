@@ -28,7 +28,7 @@ Keep `watch-app/` self-contained. `zeus build` compiles every `.js` file in it, 
 
 The server runs on the homelab: **https://lezepplean.taptappers.club** (DNS in `oh-my-dns`, `A lezepplean`), deployed by `homelab.setup/kubernetes/apps/lezepplean` from the image `ghcr.io/rounakdatta/le-zepp-lean` and the chart `oci://ghcr.io/rounakdatta/charts/lezepplean`. The bearer token is the Bitwarden item `lezepplean/token` (and `pass api-keys/lezepplean/token`); `tools/install-watch.sh` builds the watch app against it unless a local tunnel is running.
 
-Releasing: bump `charts/lezepplean/Chart.yaml` `version` + `appVersion` and `values.yaml` `image.tag` together, merge to `main`, push an annotated tag `vX.Y.Z` (CI: tests, then image + chart at that version), then bump `homelab.setup` (kustomization `version`, values `image.tag`, re-render the vendored chart, `charts.lock`) and deploy that branch with `deploy-stuff.yml` before merging it. The pod is pinned to the control plane, takes no CPU request (the node's requests are full; its usage isn't), and its `/data` volume is left out of Velero's nightly backup: everything on it can be rebuilt.
+Releasing: bump `charts/lezepplean/Chart.yaml` `version` + `appVersion` and `values.yaml` `image.tag` together, merge to `main`, push an annotated tag `vX.Y.Z` (CI: tests, then image + chart at that version; the image reports the tag on `/health`), then bump `homelab.setup` (kustomization `version`, values `image.tag`, re-render the vendored chart, `charts.lock`) and deploy that branch with `deploy-stuff.yml` before merging it. The pod is pinned to the control plane, takes no CPU request (the node's requests are full; its usage isn't), and its `/data` volume is left out of Velero's nightly backup: everything on it can be rebuilt.
 
 ## Commands
 
@@ -151,7 +151,7 @@ watch: lines [start, text, wordStarts|null, end|null]; the current line is one w
 - Lines below confidence 0.10 were right within 300 ms only ~40% of the time, so they are sent without word timings and shown line by line.
 - CTC letters fire ~30 ms after the sung onset (median); `WORD_BIAS_MS = -30` corrects it.
 - Without a cap on how long a line can last, a line followed by a long instrumental break got its words smeared across the break. 99% of lines are sung within 3 s + 0.8 s per syllable of their start.
-- Cost per 4-minute song, AMD EPYC, 3 threads: Spleeter ~7 s, wav2vec 2.0 ~26 s. Peak memory ~1 GB in the worker process (Spleeter one block at a time: 940 MB; four at a time: 2 GB).
+- Cost per 4-minute song, AMD EPYC, 3 threads: Spleeter ~7 s, wav2vec 2.0 ~26 s. Peak memory ~1.15 GB in the worker over a new song's four steps. ONNX Runtime's default memory pool took it to 2.1 GB and kept it, which ran the 2 GiB pod out of memory on its first song (10 Oct). Spleeter runs one block at a time (four at a time: 2 GB).
 
 **Fast re-sync (track.py)**
 - On simulated room+codec audio: 2 s windows placed with a median error of 23 ms (a constant shift: −7.6 ms codec-only, ~−20 ms with room); 0 of 400 more than 300 ms off; 3–5 ms per search.
@@ -209,6 +209,7 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 | A step is recorded as tried *before* it runs, and waits 1 min, 4, 16 … 6 h after a failure, across restarts | A step that runs the worker out of memory was otherwise re-run on every word poll (14 worker deaths in 7 requests), and after each restart |
 | Nothing is learned about the room while a resume is unconfirmed; a rejected resume restores the music level from before the pause; the room's floor is learned only from sound near it | Talking at the wrist during a pause taught it a music level of 38 where the music was 28, and the music could then never resume; and music held back by the raised bar was learned as "room", after which quiet beats read as pauses (51 times in 40 simulated sessions) |
 | The worker process starts when a new song's audio starts downloading and exits after 5 idle minutes | Its models hold ~340 MB; idle, the server is ~130 MB. Loading them during the download costs no latency |
+| The speech model's ONNX memory pool is sized exactly and emptied after each chunk; the separator keeps the default pool | The default pool grows by doubling and keeps everything: 2.1 GB after one new song, which killed the pod. Now 1.15 GB, identical output, ~3% more time. The separator's blocks are all one size, so its pool stops at ~300 MB, and the exact pool would cost it 20% |
 | Fast re-sync on the song's own audio, Shazam as fallback | ~30 ms instead of ~500 ms, works on 2 s, and is more consistent than Shazam on room audio |
 | Display timing: a line appears 300 ms early, a word lights 40 ms early, timers at exact change times | Reading ahead; drawing time |
 

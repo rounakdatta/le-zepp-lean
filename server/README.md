@@ -87,7 +87,7 @@ The homelab runs it: `https://lezepplean.taptappers.club`, from `homelab.setup/k
 - `.github/workflows/docker.yml` runs the tests, then builds `server/Dockerfile` into `ghcr.io/rounakdatta/le-zepp-lean` and packages `charts/lezepplean` to `oci://ghcr.io/rounakdatta/charts`. A `v*` tag publishes both at exactly the chart's version; a push to `main` publishes `<version>+<sha>`.
 - To release: bump `charts/lezepplean/Chart.yaml` (`version` and `appVersion`) and `values.yaml` (`image.tag`) together, merge, and push an annotated tag `vX.Y.Z`. Then in `homelab.setup` bump `version` (kustomization) and `image.tag` (values), re-render the vendored chart, regenerate `kubernetes/charts.lock`, and deploy from the branch before merging (see that repo's notes).
 
-**Resources** (AMD EPYC, 2–3 threads): per new 4-minute song about 35 s of CPU (Spleeter ~7 s, wav2vec 2.0 ~26 s) and ~1 GB peak in the worker; nothing for songs already prepared. Requests take ~30 ms (fast re-sync) to ~1 s (Shazam + lyrics). `Dockerfile` builds a CPU-only image (~300 MB of Python packages, no PyTorch).
+**Resources** (AMD EPYC, 2–3 threads): per new 4-minute song about 35 s of CPU (Spleeter ~7 s, wav2vec 2.0 ~26 s) and ~1.15 GB peak in the worker; nothing for songs already prepared. Requests take ~30 ms (fast re-sync) to ~1 s (Shazam + lyrics). `Dockerfile` builds a CPU-only image (~300 MB of Python packages, no PyTorch).
 
 ## Debugging and measuring
 
