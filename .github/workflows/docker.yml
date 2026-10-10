@@ -1,0 +1,91 @@
+name: Build and Push Docker Image + Helm Chart
+
+# The server's image and its Helm chart, as texas-fold-em does it. A v* tag publishes
+# both at exactly Chart.yaml's version (what homelab.setup pins); a push to main
+# publishes a traceable <version>+<sha> chart and the image's branch/sha tags. A pull
+# request only runs the tests. The watch app is not built here: it is installed from a
+# Mac (tools/install-watch.sh).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Push Helm chart to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # On a version tag (v1.2.3), publish the chart as-is from Chart.yaml.
+          # On a plain main push, append +<sha> so every commit produces a
+          # distinct, traceable chart version without requiring a manual bump.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            helm package charts/lezepplean
+          else
+            SHA=$(echo "$GITHUB_SHA" | head -c 7)
+            BASE_VER=$(grep '^version:' charts/lezepplean/Chart.yaml | awk '{print $2}')
+            helm package charts/lezepplean --version "${BASE_VER}+${SHA}"
+          fi
+          helm push lezepplean-*.tgz oci://ghcr.io/rounakdatta/charts
+
+  # The suites the repo already has: build-and-push waits for them, so a tag can't
+  # publish what doesn't pass.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Watch logic (Node)
+        run: node --test 'tests/**/*.test.mjs'
+      - uses: astral-sh/setup-uv@v6
+      - name: Server (pytest)
+        working-directory: server
+        run: uv run --frozen pytest -q

@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as sync from '../../watch-app/lib/sync.js'
+import * as clock from '../../watch-app/lib/clock.js'
 
 const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-6, `${actual} != ${expected}`)
 
@@ -20,27 +21,6 @@ test('lineIndexAt finds the line being sung', () => {
   assert.equal(sync.lineIndexAt(LINES, 29960), 3)
   assert.equal(sync.lineIndexAt(LINES, 999999), 3)
   assert.equal(sync.lineIndexAt([], 5000), -1)
-})
-
-test('song position follows the watch clock from one recognition', () => {
-  // Watch time 1_000_000: clip starts; the server says that was 143,987.7 ms into the song.
-  const clock = sync.addEstimate(sync.createClock(), 1_000_000 - 143_987.7)
-  near(sync.positionAt(clock, 1_000_000), 143_987.7)
-  near(sync.positionAt(clock, 1_010_000), 153_987.7)
-  near(sync.positionAt(clock, 1_010_000, 100), 154_087.7) // UP nudge shows lyrics 0.1 s earlier
-})
-
-test('estimates are combined by median, and a jump restarts the clock', () => {
-  const clock = sync.createClock()
-  sync.addEstimate(clock, 5000)
-  sync.addEstimate(clock, 5040)
-  sync.addEstimate(clock, 4990)
-  assert.equal(clock.start, 5000)
-  sync.addEstimate(clock, 5400) // small wobble: median of the last five
-  assert.equal(clock.start, 5020)
-  sync.addEstimate(clock, 9000) // music paused or skipped: start over
-  assert.deepEqual(clock.samples, [9000])
-  assert.equal(clock.start, 9000)
 })
 
 test('msUntilNextLine and lineProgress', () => {
@@ -65,13 +45,27 @@ test('end to end: the server offset drives the displayed line', () => {
   // "Blinding Lights"; the line starting at 150,270 ms is being sung.
   const lines = [[144330, 'I said, "Ooh, I\'m blinded by the lights'], [150270, 'I said, "Ooh, I\'m blinded by the lights'], [156330, 'No, I can\'t sleep until I feel your touch"']]
   const startedAt = 50_000
-  const clock = sync.addEstimate(sync.createClock(), startedAt - 151_052.9)
+  const c = clock.createClock()
+  clock.addMatch(c, startedAt, 151_052.9)
   const lead = 150
   // 5 s of recording + ~3 s of round trip later, we should be on the third line.
   const now = startedAt + 8_000
-  const idx = sync.lineIndexAt(lines, sync.positionAt(clock, now) + lead)
+  const idx = sync.lineIndexAt(lines, clock.songAt(c, now) + lead)
   assert.equal(idx, 2)
   // And the switch into that line was scheduled for exactly when it starts (minus the lead).
   const before = startedAt + (156_330 - 151_052.9) - lead - 1
-  assert.equal(sync.lineIndexAt(lines, sync.positionAt(clock, before) + lead), 1)
+  assert.equal(sync.lineIndexAt(lines, clock.songAt(c, before) + lead), 1)
+})
+
+test('a word sung just before the next line still lights before the line changes', () => {
+  // "one two three" with "three" starting 200 ms before the next line: with the next line
+  // shown 300 ms early, "three" used to be skipped entirely.
+  const lines = [[1000, 'one two three', [1000, 1400, 2800], 3000], [3000, 'four five', [3000, 3400], 4000]]
+  const d = sync.displayAt(lines, 2800, 300, 40)
+  assert.equal(d.line, 0, 'still on the first line')
+  assert.equal(d.word, 2, 'with "three" lit')
+  // and the next line comes in time for its first word
+  const e = sync.displayAt(lines, 3000 - 40, 300, 40)
+  assert.equal(e.line, 1)
+  assert.equal(e.word, 0)
 })

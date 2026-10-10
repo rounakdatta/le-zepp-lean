@@ -34,18 +34,25 @@ test('music coming back is reported at its first loud packet', () => {
   assert.deepEqual(events, [{ type: 'pause', packet: 2 }, { type: 'resume', packet: 8 }])
 })
 
-test('after a rejected resume the same noise level no longer resumes', () => {
+test('after a rejected resume, the same noise cannot resume again after a quiet spell, but the music can', () => {
   const a = activity.createActivity()
   ;[16, 16, 16, 16].forEach((g, i) => activity.pushLevel(a, g, i))
   let e = null
   ;[24, 24, 24, 24].forEach((g, i) => (e = activity.pushLevel(a, g, 4 + i) || e))
   assert.equal(e.type, 'resume')
-  activity.rejectResume(a, 24)
+  activity.rejectResume(a, 24) // the server: not the song
+  ;[16, 16, 16, 16, 16].forEach((g, i) => activity.pushLevel(a, g, 8 + i)) // quiet again: paused
   e = null
-  ;[24, 24, 24, 24, 24].forEach((g, i) => (e = activity.pushLevel(a, g, 8 + i) || e))
-  assert.equal(e, null)
-  ;[30, 31, 30, 32].forEach((g, i) => (e = activity.pushLevel(a, g, 13 + i) || e))
-  assert.equal(e.type, 'resume')
+  ;[24, 24, 24, 24, 24].forEach((g, i) => (e = activity.pushLevel(a, g, 13 + i) || e))
+  assert.equal(e, null, 'the same talking does not resume')
+  ;[30, 31, 30, 32].forEach((g, i) => (e = activity.pushLevel(a, g, 18 + i) || e))
+  assert.equal(e.type, 'resume', 'the music does')
+})
+
+test('a rejected resume never sets the bar above the music level itself', () => {
+  const a = activity.createActivity()
+  activity.rejectResume(a, 60) // someone shouting right at the watch
+  assert.ok(activity.resumeThreshold(a) <= a.musicLevel - 2)
 })
 
 // Local-only: replay the real watch recordings (not in git) through the detector.
@@ -93,21 +100,6 @@ test('packet stream stops on bytes that are not the recorder framing', () => {
   assert.equal(s.broken, true)
 })
 
-test('pausing freezes the song position; resuming shifts the song start by the pause', () => {
-  const clock = sync.addEstimate(sync.createClock(), 1000)
-  assert.equal(sync.positionAt(clock, 6000), 5000)
-  sync.pauseClock(clock, 6000)
-  assert.equal(sync.positionAt(clock, 9000), 5000)
-  assert.equal(sync.isPaused(clock), true)
-  sync.resumeClock(clock, 10000)
-  assert.equal(sync.positionAt(clock, 10000), 5000)
-  assert.equal(sync.positionAt(clock, 12000), 7000)
-  assert.deepEqual(clock.samples, [5000])
-  // a re-sync after the resume agrees with the shifted start
-  sync.addEstimate(clock, 5010)
-  assert.equal(clock.start, 5005)
-})
-
 test('word index and next-change timing within a line', () => {
   const lines = [[1000, 'Today is gonna be', [1000, 1400, 1700, 2100]], [3000, 'the day', [3000, 3300]]]
   assert.equal(sync.wordIndexAt(lines[0][2], 1500), 1)
@@ -131,4 +123,16 @@ test('lines appear early, words light up on time, and the next change is schedul
   assert.deepEqual(sync.displayAt(lines, 3400, 300, 40), { line: 1, word: 1, waitMs: null })
   // before anything: no line, waiting for the first one
   assert.deepEqual(sync.displayAt(lines, 0, 300, 40), { line: -1, word: -1, waitMs: 700 })
+})
+
+test('a noisy room (silence at 22) still learns its floor, so a later stop is caught without the track', () => {
+  const a = activity.createActivity()
+  let i = 0
+  const music = (n, expectedOf) => { const ev = []; for (let k = 0; k < n; k++, i++) { const g = 30 + (k % 9); const e = activity.pushLevel(a, g, i, expectedOf ? expectedOf(g) : null); if (e) ev.push(e) } return ev }
+  const quiet = (n, expected) => { const ev = []; for (let k = 0; k < n; k++, i++) { const e = activity.pushLevel(a, 22, i, expected); if (e) ev.push(e) } return ev }
+  music(200, (g) => g - 10) // the song's track calibrates against this room
+  assert.deepEqual(quiet(40, 30).map((e) => e.type), ['pause'], 'first stop: caught by the track (the song should be loud)')
+  assert.deepEqual(music(40).map((e) => e.type), ['resume'])
+  // a second stop where the track can't help (none, or not calibrated): the learned floor must
+  assert.deepEqual(quiet(40, null).map((e) => e.type), ['pause'], `floor ${a.floor.toFixed(1)} (learned ${a.floorN} times)`)
 })

@@ -1,0 +1,9 @@
+.venv/
+data/
+captures/
+models/
+tests/
+scripts/
+__pycache__/
+.pytest_cache/
+.token

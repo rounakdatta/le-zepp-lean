@@ -25,15 +25,15 @@ function parseBody(res) {
   return typeof res.body === 'string' ? JSON.parse(res.body) : res.body
 }
 
-function identify(params) {
+function post(path, payload) {
   const { url, token } = config()
   if (!url) return Promise.resolve({ ok: false, reason: 'no_server', message: 'Set the server URL in LeZeppLean settings' })
   const startedAt = Date.now()
   return fetch({
-    url: url + '/identify',
+    url: url + path,
     method: 'POST',
     headers: headers(token, true),
-    body: JSON.stringify({ audio: params.audio, format: 'zepp-opus', clipMs: params.clipMs, client: params.diag }),
+    body: JSON.stringify(payload),
     timeout: FETCH_TIMEOUT_MS,
   }).then((res) => {
     const body = parseBody(res) || {}
@@ -43,6 +43,25 @@ function identify(params) {
     body.phoneMs = Date.now() - startedAt
     return body
   })
+}
+
+// A recording from the watch: which song, where in it, and what has changed.
+function identify(params) {
+  return post('/identify', {
+    audio: params.audio,
+    format: 'zepp-opus',
+    clipMs: params.clipMs,
+    purpose: params.purpose || 'find',
+    song: params.song || null,
+    expectMs: params.expectMs === undefined ? null : params.expectMs,
+    known: params.known || null,
+    client: params.diag,
+  })
+}
+
+// No audio: word timings (and the loudness track) for a song, if they have changed.
+function lyrics(params) {
+  return post('/lyrics', { song: params.song, known: params.known || null })
 }
 
 function ping() {
@@ -68,13 +87,14 @@ AppSideService(
     onInit() {},
 
     onRequest(req, res) {
-      if (req.method === 'identify') {
-        identify(req.params || {})
-          .then((body) => res(null, body))
-          .catch((e) => res(null, { ok: false, reason: 'phone', message: 'Could not reach the server: ' + ((e && e.message) || e) }))
+      const handler = req.method === 'identify' ? identify : req.method === 'lyrics' ? lyrics : null
+      if (!handler) {
+        res(null, { ok: false, reason: 'unknown_method' })
         return
       }
-      res(null, { ok: false, reason: 'unknown_method' })
+      handler(req.params || {})
+        .then((body) => res(null, body))
+        .catch((e) => res(null, { ok: false, reason: 'phone', message: 'Could not reach the server: ' + ((e && e.message) || e) }))
     },
 
     onSettingsChange({ key }) {

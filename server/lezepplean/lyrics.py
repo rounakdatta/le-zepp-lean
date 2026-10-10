@@ -16,7 +16,7 @@ import httpx
 
 LRCLIB = "https://lrclib.net/api"
 ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
-USER_AGENT = "LeZeppLean/0.1 (personal smartwatch lyrics project)"
+USER_AGENT = "LeZeppLean/0.2 (personal smartwatch lyrics project)"
 DURATION_TOLERANCE_S = 3.0
 
 _TIMESTAMP = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
@@ -32,6 +32,7 @@ class Lyrics:
     source: str | None = None
     source_id: int | None = None
     duration_s: float | None = None    # duration of the recording the lyrics were timed against
+    definite: bool = True              # False: LRCLIB couldn't be asked properly; "none" may not mean none
 
 
 def parse_lrc(text: str) -> list[tuple[int, str]]:
@@ -94,33 +95,45 @@ class LyricsFinder:
         self._cache: dict[tuple, Lyrics] = {}
 
     async def itunes_duration_s(self, apple_id: str | None) -> float | None:
+        return (await self.itunes_lookup(apple_id))[0]
+
+    async def itunes_lookup(self, apple_id: str | None) -> tuple[float | None, bool]:
+        """(track length in s, whether the lookup worked). Without a length, LRCLIB's
+        same-recording check can't be made, so callers need to know a failure from a miss."""
         if not apple_id:
-            return None
+            return None, True
         try:
             r = await self._client.get(ITUNES_LOOKUP, params={"id": apple_id}, timeout=4)
+            if r.status_code != 200:
+                return None, False
             results = r.json().get("results") or []
             millis = results[0].get("trackTimeMillis") if results else None
-            return millis / 1000 if millis else None
+            return (millis / 1000 if millis else None), True
         except (httpx.HTTPError, ValueError):
-            return None
+            return None, False
 
     async def find(self, title: str, artist: str, album: str | None, duration_s: float | None) -> Lyrics:
         key = (title.casefold(), artist.casefold(), round(duration_s) if duration_s else None)
         if key in self._cache:
             return self._cache[key]
-        result = await self._find_uncached(title, artist, album, duration_s)
-        if result.kind != "none":
+        errors: list[str] = []
+        result = await self._find_uncached(title, artist, album, duration_s, errors)
+        if result.kind != "synced" and errors:
+            # A timeout or a 5xx is not "this song has no lyrics": say so, so it is asked again.
+            result.definite = False
+        if result.kind != "none" and result.definite:
             self._cache[key] = result
         return result
 
-    async def _find_uncached(self, title: str, artist: str, album: str | None, duration_s: float | None) -> Lyrics:
+    async def _find_uncached(self, title: str, artist: str, album: str | None, duration_s: float | None,
+                             errors: list[str]) -> Lyrics:
         # 1. Exact lookup: LRCLIB only answers when its stored duration is within ~2 s of ours.
         if duration_s:
             for params in (
                 {"track_name": title, "artist_name": artist, "album_name": album or "", "duration": round(duration_s)},
                 {"track_name": title, "artist_name": artist, "duration": round(duration_s)},
             ):
-                record = await self._get_json("/get", params)
+                record = await self._get_json("/get", params, errors)
                 if isinstance(record, dict) and record.get("syncedLyrics"):
                     return _lyrics_from_record(record)
 
@@ -132,7 +145,7 @@ class LyricsFinder:
             {"track_name": clean_title, "artist_name": primary_artist(artist)},
             {"q": f"{clean_title} {primary_artist(artist)}"},
         ):
-            found = await self._get_json("/search", params)
+            found = await self._get_json("/search", params, errors)
             if isinstance(found, list) and found:
                 candidates = found
                 break
@@ -155,14 +168,19 @@ class LyricsFinder:
                           source_id=plain[0].get("id"), duration_s=plain[0].get("duration"))
         return Lyrics(kind="none")
 
-    async def _get_json(self, path: str, params: dict):
+    async def _get_json(self, path: str, params: dict, errors: list[str]):
         try:
             r = await self._client.get(LRCLIB + path, params=params, headers={"User-Agent": USER_AGENT}, timeout=5)
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            errors.append(f"{path}: {type(e).__name__}")
             return None
+        if r.status_code == 404:
+            return None  # LRCLIB's "no such lyrics": a real answer
         if r.status_code != 200:
+            errors.append(f"{path}: HTTP {r.status_code}")
             return None
         try:
             return r.json()
         except ValueError:
+            errors.append(f"{path}: bad JSON")
             return None
