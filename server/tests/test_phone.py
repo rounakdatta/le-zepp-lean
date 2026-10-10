@@ -122,3 +122,29 @@ def test_youtube_videos_are_named_by_their_title(api, monkeypatch):
             break
         time.sleep(0.05)
     assert seen["asked"] == ("Wonderwall (Official Video)", "Oasis")
+
+
+def test_a_lyrics_lookup_that_fails_is_retried_while_the_song_plays(api, monkeypatch):
+    client, app_module, _ = api
+    monkeypatch.setattr(app_module, "PHONE_LYRICS_RETRY_S", (0.2, 0.2, 0.2))
+    tries = {"n": 0}
+
+    async def flaky(title, artist, album, duration_s):
+        tries["n"] += 1
+        if tries["n"] == 1:   # LRCLIB timed out: not an answer
+            return Lyrics(kind="none", definite=False)
+        return Lyrics(kind="synced", lines=[(1000, "Hello world")], source="lrclib", source_id=7)
+
+    monkeypatch.setattr(app_module._lyrics, "find", flaky)
+    client.post("/phone", json=update(title="Sorry if I Hurt You", artist="Charli xcx", durationMs=161_000))
+    seen = set()
+    for _ in range(60):
+        view = client.get("/phone/next", params={"since": -1}).json()
+        if view["songId"]:
+            kind = client.post("/lyrics", json={"song": view["songId"]}).json()["lyrics"]["kind"]
+            seen.add(kind)
+            if kind == "synced":
+                break
+        time.sleep(0.05)
+    assert kind == "synced", "found on the retry, without anyone asking"
+    assert "none" not in seen, "the watch was never told there are no lyrics"

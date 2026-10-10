@@ -71,6 +71,10 @@ LYRICS_RETRY_S = 120       # LRCLIB couldn't be asked properly: ask again after 
 # taken 6.5 s, and the watch waited on "Listening…" all that time. Its lyrics follow on the
 # watch's next poll ("pending" until then).
 LYRICS_WAIT_S = 1.5
+# A song playing on the phone whose lyrics lookup failed (LRCLIB down or slow) is asked about
+# again this soon, while it plays, instead of in 2 minutes when the watch next asks: a first
+# lookup that failed left "Sorry if I Hurt You" without lyrics until someone asked again.
+PHONE_LYRICS_RETRY_S = (5, 10, 20, 40, 60)
 
 # Fast re-sync must be sure before it overrules Shazam. Measured on simulated room
 # recordings (scripts/eval_track.py, scripts/sim_stream.py): a right placement scores
@@ -411,7 +415,18 @@ async def _resolve_phone_track(track: tuple, app_id: str, title: str, artist: st
             _phone.bump()
         if song.lyrics_kind == "pending":
             # the player's own length: the lyrics are timed for this recording or not at all
-            await _lookup_lyrics(song, length_ok=bool(duration_ms))
+            for wait in (0,) + PHONE_LYRICS_RETRY_S:
+                if wait:
+                    await asyncio.sleep(wait)
+                    if _phone.now.track != track:
+                        break  # another song now: it is looked up the next time it plays
+                await _lookup_lyrics(song, length_ok=bool(duration_ms))
+                if song.lyrics_kind == "synced" or not song.lyrics_retry_at:
+                    break  # found, or LRCLIB answered that it has none
+                song.lyrics_kind = "pending"  # LRCLIB couldn't be asked: still coming, not "none"
+                _store.put(song)
+            if song.lyrics_kind == "pending":
+                song.lyrics_kind = "none"
             _store.put(song)
             if _phone.now.track == track:
                 _phone.bump()  # the watch asks for the lyrics when it hears of a change

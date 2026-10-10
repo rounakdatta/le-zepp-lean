@@ -55,8 +55,9 @@ const IDENTIFY_RETRY_PACKETS = 50 // ~3 s of new audio before trying again
 const DOUBT_BACKOFF_MAX = 8 // after a doubtful resume, re-checks space out: 5 s, 10 s, 20 s, ... 40 s
 const ERROR_BACKOFF_MS = 6000
 // The server answers a new song within 1.5 s, lyrics or not ("pending" while its lookup
-// runs): ask again this often until they come.
+// runs): ask again this soon, then less and less often (LRCLIB can be down for a while).
 const LYRICS_PENDING_POLL_MS = 1500
+const LYRICS_PENDING_POLL_MAX_MS = 10000
 // Phone mode: paused this long, the phone is no longer what plays here; the room is listened
 // to again (and the phone takes over the moment it plays).
 const PHONE_IDLE_MS = 60000
@@ -514,7 +515,7 @@ export function onPhone(s, view, now) {
   } else if (view.songId && s.song.id !== view.songId) {
     s.song.id = view.songId // the server has worked out which song it is: lyrics next
     s.nextLyricsAt = now
-  } else if (view.songId && s.song.kind === 'pending') {
+  } else if (view.songId && s.song.kind !== 'synced') {
     s.nextLyricsAt = now // something changed on the server: its lyrics may have come
   }
   if (view.durationMs) s.song.durationMs = view.durationMs
@@ -809,9 +810,11 @@ function mergeSongData(s, res, now) {
   }
   if (res.sync) song.fast = !!res.sync.fast
   if (song.kind === 'pending') {
-    s.nextLyricsAt = now + LYRICS_PENDING_POLL_MS
+    s.pendingPolls = (s.pendingPolls || 0) + 1
+    s.nextLyricsAt = now + Math.min(LYRICS_PENDING_POLL_MAX_MS, LYRICS_PENDING_POLL_MS * Math.pow(1.5, s.pendingPolls - 1))
     return
   }
+  s.pendingPolls = 0
   if (res.words) {
     song.words = res.words
     const eta = res.words.etaMs || 8000
