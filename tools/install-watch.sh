@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Install LeZeppLean on the watch in one step:
 #   1. signs in to Zepp if needed (a browser window opens; use an email + password Zepp account),
-#   2. builds the app with the running server's address and token built in, so there is
-#      nothing to type in the Zepp app (set LEZEPPLEAN_SERVER_URL to use another server),
+#   2. builds the app with a server's address and token built in, so there is nothing to
+#      type in the Zepp app. The server is, in order: LEZEPPLEAN_SERVER_URL; a local server's
+#      quick tunnel, if one is running (tools/serve.sh); otherwise the homelab,
+#      https://lezepplean.taptappers.club, whose token comes from LEZEPPLEAN_TOKEN or
+#      `pass api-keys/lezepplean/token` (Bitwarden item lezepplean/token),
 #   3. uploads a preview build to Zepp and shows the install QR code, in the terminal and
 #      as a large image in the browser.
 # Then on the phone: Zepp app → Profile → Developer Mode → Scan.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/watch-app"
+HOMELAB_URL="https://lezepplean.taptappers.club"
 DEFAULTS="$APP/app-side/defaults.js"
 
 cd "$APP"
@@ -30,7 +34,18 @@ if [ -z "$server_url" ]; then
     fi
   done
 fi
-token="$(tr -d '[:space:]' < "$ROOT/server/.token" 2>/dev/null || true)"
+if [ -z "$server_url" ]; then
+  server_url="$HOMELAB_URL"
+fi
+if [ "$server_url" = "$HOMELAB_URL" ]; then
+  token="${LEZEPPLEAN_TOKEN:-$(pass show api-keys/lezepplean/token 2>/dev/null | head -n1 | tr -d '[:space:]' || true)}"
+  if [ -z "$token" ]; then
+    echo "No token for $HOMELAB_URL: set LEZEPPLEAN_TOKEN (Bitwarden item lezepplean/token) and run again."
+    exit 1
+  fi
+else
+  token="$(tr -d '[:space:]' < "$ROOT/server/.token" 2>/dev/null || true)"
+fi
 
 if [ -n "$server_url" ]; then
   echo "Building with server $server_url"
@@ -42,9 +57,6 @@ if [ -n "$server_url" ]; then
     echo "export const DEFAULT_SERVER_URL = '$server_url'"
     echo "export const DEFAULT_TOKEN = '$token'"
   } > "$DEFAULTS"
-else
-  echo "No running tunnel found and LEZEPPLEAN_SERVER_URL is not set."
-  echo "After installing, enter the server in the Zepp app: your watch → LeZeppLean settings."
 fi
 
 export LEZEPPLEAN_QR_OUT="${TMPDIR:-/tmp}/lezepplean-install-qr.html"

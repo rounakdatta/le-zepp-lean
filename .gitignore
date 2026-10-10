@@ -10,3 +10,8 @@ __pycache__/
 .pytest_cache/
 
 .DS_Store
+
+# models downloaded on first use: wav2vec 2.0 and Spleeter (lezepplean/align)
+server/models/
+# song cache: reference audio, features, word timings (server/lezepplean/songs.py)
+server/data/
