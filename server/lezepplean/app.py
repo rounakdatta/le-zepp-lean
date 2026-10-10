@@ -91,8 +91,6 @@ _recent: deque[dict] = deque(maxlen=30)
 
 @asynccontextmanager
 async def lifespan(_app):
-    if os.environ.get("LEZEPPLEAN_WARM", "1") == "1":
-        _preparer.warm()  # the first song heard shouldn't wait for a process to start and models to load
     yield
     _preparer.close()
 

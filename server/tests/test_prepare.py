@@ -247,3 +247,50 @@ def test_timings_for_old_lyrics_are_not_written_into_new_ones(tmp_path):
     asyncio.run(scenario())
     w = store.get("s1").words
     assert w.get("status") == "pending" and not w.get("lines"), w
+
+
+def test_the_worker_is_let_go_when_idle_and_started_again_when_a_song_arrives(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+
+    monkeypatch.setattr(prepare, "IDLE_RELEASE_S", 0.05)
+    store = SongStore(tmp_path)
+    for sid in ("s1", "s2"):
+        s = song(sid)
+        s.reference_status = "pending"
+        s.reference = None
+        store.put(s)
+    events = []
+
+    class Pool:
+        def submit(self, fn, *args):
+            events.append(fn.__name__)
+            f = Future()
+            f.set_result(True)
+            return f
+
+        def shutdown(self, **_kw):
+            events.append("released")
+
+    async def slow_and_nothing_found(_song):
+        await asyncio.sleep(0.12)         # longer than the idle time: a download is work too
+        events.append("fetched")
+        return None
+
+    p = prepare.Preparer(store, recognize=None, fetch_reference=slow_and_nothing_found)
+
+    def pool():
+        if p._executor is None:
+            p._executor = Pool()
+        return p._executor
+
+    p._pool = pool
+
+    async def scenario():
+        p.ensure(store.get("s1"), 0)     # a new song: the worker starts while its audio downloads
+        await asyncio.sleep(0.5)          # nothing to do afterwards: let go
+        p.ensure(store.get("s2"), 0)     # the next new song starts it again
+        await asyncio.sleep(0.01)
+        p._consumer.cancel()
+
+    asyncio.run(scenario())
+    assert events == ["warm", "fetched", "released", "warm"], events
