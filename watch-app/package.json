@@ -1,0 +1,20 @@
+{
+  "name": "lezepplean-watch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zepp OS app for the Amazfit T-Rex 3: listens to the music around you and shows time-synced lyrics",
+  "scripts": {
+    "build": "zeus build",
+    "dev": "zeus dev",
+    "login": "zeus login",
+    "preview": "zeus preview -t \"Amazfit T-Rex 3\"",
+    "bridge": "zeus bridge"
+  },
+  "dependencies": {
+    "@zeppos/zml": "0.0.43"
+  },
+  "devDependencies": {
+    "@zeppos/device-types": "^4.0.0",
+    "@zeppos/zeus-cli": "1.9.3"
+  }
+}
