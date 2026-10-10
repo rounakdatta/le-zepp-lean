@@ -1,0 +1,61 @@
+# The Android helper (android/): what the phone's players are playing, sent to the server so
+# the watch can follow music in earphones. Built on every change; a helper-v* tag publishes
+# the signed APK as a GitHub release (the server's own v* tags don't match helper-v*).
+name: Android helper
+
+on:
+  push:
+    branches: [main]
+    tags: ['helper-v*']
+    paths: ['android/**', '.github/workflows/android.yml']
+  pull_request:
+    paths: ['android/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      # The same key every time, so a new version installs over the old one. Pull requests
+      # (and forks) don't get it: they build debug-signed, to check that it builds.
+      - name: Signing key
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then printf '%s' "$KEYSTORE_B64" | base64 -d > android/release.keystore; fi
+
+      - name: Build
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: gradle -p android assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lezepplean-helper
+          path: android/app/build/outputs/apk/release/*.apk
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/helper-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#helper-v}"
+          cp android/app/build/outputs/apk/release/app-release.apk "lezepplean-helper-$version.apk"
+          gh release create "$GITHUB_REF_NAME" "lezepplean-helper-$version.apk" \
+            --title "LeZeppLean helper $version" \
+            --notes "Install on the Android phone that plays the music, allow it to see what plays, paste the server token. See android/README.md."

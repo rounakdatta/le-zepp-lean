@@ -15,3 +15,10 @@ __pycache__/
 server/models/
 # song cache: reference audio, features, word timings (server/lezepplean/songs.py)
 server/data/
+
+# Android helper build output and the signing key (it lives in the repository's secrets)
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/release.keystore

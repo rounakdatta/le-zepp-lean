@@ -74,6 +74,9 @@ let diag = {}
 let system = {}
 let startedAt = 0
 let hintShownAt = 0
+let phoneTimer = null
+let bleOneWayMs = 150 // half a phone round trip, measured below
+const PHONE_ASK_MS = 20000 // the relay follows the phone's player only while asked this often
 
 function guard(name, fn) {
   return function () {
@@ -88,6 +91,11 @@ function guard(name, fn) {
 
 Page(
   BasePage({
+    // The relay on the phone, the moment the phone's player changes (see app-side).
+    onCall: guard('onCall', function (data) {
+      if (data && data.method === 'phone') onPhoneView(data.params, null)
+    }),
+
     onInit: guard('onInit', function () {
       page = this
       prefs = loadPrefs()
@@ -108,11 +116,13 @@ Page(
       onKey({ callback: guard('key', onKeyEvent) })
       tickTimer = setInterval(guard('tick', tick), TICK_MS)
       startListening()
+      askPhone()
     }),
 
     onDestroy: guard('onDestroy', function () {
       clearTimeout(lineTimer)
       clearTimeout(takeTimer)
+      clearTimeout(phoneTimer)
       clearInterval(tickTimer)
       stopLive(live)
       offKey()
@@ -140,6 +150,10 @@ function startListening() {
       afterSession(req, now)
     }),
     onTake: guard('onTake', (take) => {
+      if (mode === 'phone') {
+        live = null // the phone took over while this was recording
+        return
+      }
       // This firmware writes the file only at stop(): carry on with separate takes.
       mode = 'takes'
       diag.mode = 'takes'
@@ -148,7 +162,7 @@ function startListening() {
       lastStopAt = Date.now()
       live = null // its recorder is finished: the watch has only one
       if (take.buffer && take.bytes) onTake(take)
-      scheduleTake(TAKE_GAP_MS)
+      if (mode === 'takes') scheduleTake(TAKE_GAP_MS)
     }),
     onError: guard('onLiveError', (code, message) => {
       diag.problem = code + (message ? ': ' + message : '')
@@ -161,6 +175,51 @@ function startListening() {
       refreshDebug()
     }),
   })
+}
+
+// ---- the phone's own player ---------------------------------------------------------
+
+// What the phone is playing (the LeZeppLean helper on it reports to the server; the relay
+// passes it on). Asking also keeps the relay following it, and times the link.
+function askPhone() {
+  clearTimeout(phoneTimer)
+  phoneTimer = setTimeout(guard('askPhone', askPhone), PHONE_ASK_MS)
+  const sentAt = Date.now()
+  page
+    .request({ method: 'phone', params: {} }, { timeout: 8000 })
+    .then(guard('phoneAnswer', (view) => {
+      const trip = Date.now() - sentAt
+      if (trip < 2000) bleOneWayMs = Math.round(bleOneWayMs * 0.7 + (trip / 2) * 0.3)
+      onPhoneView(view, trip)
+    }))
+    .catch(() => {})
+}
+
+function onPhoneView(pv, trip) {
+  if (!pv || typeof pv.version !== 'number') return
+  const now = Date.now()
+  // the relay's position is as of when it sent it; it has been on its way since
+  const late = trip !== null ? trip / 2 : bleOneWayMs
+  const v = pv.playing ? Object.assign({}, pv, { positionMs: pv.positionMs + late * (pv.speed || 1) }) : pv
+  const following = session.onPhone(s, v, now)
+  if (following && mode !== 'phone') {
+    // The phone is the clock now: no recordings (music in earphones can't be heard anyway).
+    mode = 'phone'
+    clearTimeout(takeTimer)
+    if (live) {
+      stopLive(live)
+      live = null
+    }
+    diag.mode = 'phone'
+  } else if (!following && mode === 'phone') {
+    mode = 'starting'
+    view.showMessage('Listening…', 'Hold the watch near the music')
+    startListening()
+  }
+  handleEvents()
+  refresh()
+  const next = session.decide(s, now)
+  if (next) send(next, null)
 }
 
 // Takes mode: record, hand the take to the session, wait, repeat.
@@ -204,7 +263,7 @@ function takeNow() {
       if (takeFailures >= 3 && !s.song) view.showMessage('Listening…', 'Hold the watch near the music')
       takeFailures = 0
       onTake(rec)
-      scheduleTake(TAKE_GAP_MS)
+      if (mode === 'takes') scheduleTake(TAKE_GAP_MS)
     }),
     (m) => logger.info(m),
   )
@@ -327,6 +386,7 @@ function handleEvents() {
       view.showSong(s.song)
       shown = { line: -2, word: -2, version: null }
       buzz()
+      if (e.source === 'phone') view.setStatus('Following your phone')
       if (!hintShownAt) {
         // The nudge keys only mean something once there are lyrics to nudge: say so then, once.
         hintShownAt = Date.now()
@@ -336,6 +396,10 @@ function handleEvents() {
       view.setPaused(true)
     } else if (e.type === 'resume' || e.type === 'resume_rejected') {
       view.setPaused(e.type === 'resume_rejected')
+    } else if ((e.type === 'ended' || e.type === 'lost') && e.source === 'phone') {
+      clearTimeout(lineTimer) // the room is listened to again (onPhoneView says so)
+      view.setPaused(false)
+      view.setSongProgress(0)
     } else if (e.type === 'ended' || e.type === 'lost') {
       clearTimeout(lineTimer)
       view.setPaused(false)

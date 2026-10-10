@@ -45,7 +45,7 @@ import numpy as np
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from . import __version__, track, zepp_opus
+from . import __version__, phone, track, zepp_opus
 from .align import MIN_LINE_CONFIDENCE
 from .lyrics import LyricsFinder
 from .prepare import Preparer
@@ -90,6 +90,7 @@ _recognizer = Recognizer()
 _lyrics = LyricsFinder(_http)
 _store = SongStore(DATA / "songs")
 _preparer = Preparer(_store, _recognizer.recognize, threads=THREADS)
+_phone = phone.Phone()
 _recent: deque[dict] = deque(maxlen=30)
 
 
@@ -111,6 +112,19 @@ class IdentifyRequest(BaseModel):
     song: str | None = None
     expectMs: float | None = None
     known: dict | None = None
+
+
+class PhoneUpdate(BaseModel):
+    """The phone's media session, from the LeZeppLean helper app (android/)."""
+    app: str = ""            # the player's package, e.g. com.spotify.music
+    title: str = ""
+    artist: str = ""
+    album: str | None = None
+    durationMs: float | None = None
+    state: str = "stopped"   # playing | paused | stopped | buffering
+    positionMs: float = 0.0  # where the track was at sentAt
+    speed: float = 1.0
+    sentAt: float | None = None  # the phone's clock, ms since 1970
 
 
 class LyricsRequest(BaseModel):
@@ -343,6 +357,69 @@ async def lyrics(req: LyricsRequest, authorization: str | None = Header(None)) -
     _refresh_lyrics_if_due(song)
     _preparer.ensure(song, None)
     return {"ok": True, "song": _song_info(song), **_song_data(song, req.known)}
+
+
+@app.post("/phone")
+async def phone_update(req: PhoneUpdate, authorization: str | None = Header(None)) -> dict:
+    """The helper app on the phone: what its player is playing, the moment that changes."""
+    _check_token(authorization)
+    t = time.time()
+    if _phone.update(req.model_dump(), t) and req.title:
+        snap = _phone.now
+        asyncio.get_running_loop().create_task(_resolve_phone_track(snap.track, snap.app, snap.title, snap.artist, snap.album, snap.duration_ms))
+    return {"ok": True, "version": _phone.now.version, "songId": _phone.now.song_id}
+
+
+@app.get("/phone/next")
+async def phone_next(since: int = -1, wait: float = 8.0, authorization: str | None = Header(None)) -> dict:
+    """The watch's relay asks what the phone is playing; when it already knows `since`, the
+    answer waits (up to 8 s: the phone's HTTP client drops a request after ~10 s) for a change."""
+    _check_token(authorization)
+    await _phone.wait(since, max(0.0, min(wait, 8.0)))
+    return _phone.view(time.time())
+
+
+def _song_by_name(title: str, artist: str, duration_ms: int | None) -> Song | None:
+    """A song already here under this name (heard in the room, or played on the phone before)."""
+    t, a = phone.name_key(title), phone.artist_key(artist)
+    if not t:
+        return None
+    best = None
+    for s in _store.all():
+        if phone.name_key(s.title) != t or phone.artist_key(s.artist) != a:
+            continue
+        if duration_ms and s.duration_ms and abs(s.duration_ms - duration_ms) > 3000:
+            continue  # another recording of it (a live version, an edit): timed differently
+        if best is None or (s.lyrics_kind == "synced") > (best.lyrics_kind == "synced"):
+            best = s
+    return best
+
+
+async def _resolve_phone_track(track: tuple, app_id: str, title: str, artist: str, album: str | None, duration_ms: int | None) -> None:
+    """Which song the phone is playing, and its lyrics and word timings on their way."""
+    try:
+        if app_id == phone.YOUTUBE:
+            title, artist = phone.from_youtube(title, artist)
+        song = _song_by_name(title, artist, duration_ms)
+        if song is None:
+            key = f"{phone.name_key(title)}|{phone.artist_key(artist)}|{round((duration_ms or 0) / 1000)}"
+            song = Song(id="p" + hashlib.sha1(key.encode()).hexdigest()[:12], title=title, artist=artist, album=album,
+                        duration_ms=duration_ms, length_checked=bool(duration_ms), lyrics_kind="pending")
+            _store.put(song)
+        if _phone.now.track == track:
+            _phone.now.song_id = song.id
+            _phone.bump()
+        if song.lyrics_kind == "pending":
+            # the player's own length: the lyrics are timed for this recording or not at all
+            await _lookup_lyrics(song, length_ok=bool(duration_ms))
+            _store.put(song)
+            if _phone.now.track == track:
+                _phone.bump()  # the watch asks for the lyrics when it hears of a change
+        else:
+            _refresh_lyrics_if_due(song)
+        _preparer.ensure(song, _phone.position(time.time()) if _phone.now.track == track else None)
+    except Exception:
+        log.exception("could not resolve %r by %r from the phone", title, artist)
 
 
 @app.post("/identify")

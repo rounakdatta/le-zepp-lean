@@ -57,6 +57,10 @@ const ERROR_BACKOFF_MS = 6000
 // The server answers a new song within 1.5 s, lyrics or not ("pending" while its lookup
 // runs): ask again this often until they come.
 const LYRICS_PENDING_POLL_MS = 1500
+// Phone mode: paused this long, the phone is no longer what plays here; the room is listened
+// to again (and the phone takes over the moment it plays).
+const PHONE_IDLE_MS = 60000
+const PHONE_SEEK_MS = 1000
 const END_GRACE_MS = 2500
 const END_ZONE_MS = 5000 // music stopping this close to the end is the song ending, not a pause
 // The room keeps ringing after the music stops, so the first packet quiet enough to count
@@ -102,6 +106,8 @@ export function createSession() {
     playingFrom: 0, // first packet of the current stretch of music: no window reaches back past it
     track: [], // recent [packet, gain, expected gain] while playing, for skip detection
     match: { last: null, baseline: null, low: 0, checks: 0 },
+    source: 'room', // 'room': the mic decides | 'phone': the phone's player does (see onPhone)
+    phone: null, // { version, track, playing, pausedSince } the phone's last word
     takeSkip: null, // takes mode: why the last take stayed on the watch ('busy' | 'quiet' | null)
     comeback: null, // takes mode: { from, failed } sound back during a pause, not yet shown to be the song
     gapFrom: -1, // takes mode: the packets [gapFrom, gapTo] fell between two takes
@@ -137,6 +143,7 @@ function emit(s, type, extra) {
 // ---- input: packets ---------------------------------------------------------------
 
 export function onPacket(s, index, gain, at, now) {
+  if (s.source === 'phone') return null // the phone says what plays; the room says nothing now
   if (s.last >= 0 && index > s.last + 1) {
     s.gapFrom = s.last + 1
     s.gapTo = index - 1
@@ -277,6 +284,7 @@ function onActivity(s, ev) {
 // ---- input: time ------------------------------------------------------------------
 
 export function onTick(s, now) {
+  if (s.source === 'phone' && s.phone && !s.phone.playing && now - s.phone.pausedSince >= PHONE_IDLE_MS) leavePhone(s)
   if (s.song && clock.isKnown(s.clock) && !clock.isPaused(s.clock) && s.song.durationMs) {
     const pos = clock.songAt(s.clock, now)
     if (pos > s.song.durationMs + END_GRACE_MS) endSong(s)
@@ -344,6 +352,7 @@ export function wantsAudio(s, now) {
 // a find whose lyrics took 6 s was replaced every time, and the song never appeared.)
 export function takeRequest(s, from, to, startAt, now) {
   s.takeSkip = null
+  if (s.source === 'phone') return null
   if (s.inflight || s.noServer || now < s.holdUntil) {
     s.takeSkip = 'busy'
     return null
@@ -464,6 +473,79 @@ function resumeAt(s, v, now) {
   emit(s, 'resume', { at, verified: 'local', r: Math.round(v.r * 100) / 100, lagMs: v.lag * PACKET_MS })
 }
 
+// ---- input: the phone ---------------------------------------------------------------
+
+// What the phone is playing, from the LeZeppLean helper on it via the server: `view` is
+// { version, title, artist, durationMs, playing, positionMs (as of `now`), speed, songId }.
+// While the phone plays, it is the clock: exact, and the only way to follow music in
+// earphones. Returns true while the phone is what is followed.
+export function onPhone(s, view, now) {
+  if (!view || typeof view.version !== 'number') return s.source === 'phone'
+  if (s.phone && view.version === s.phone.version && view.title === s.phone.title) return s.source === 'phone'
+  const track = view.title ? view.title + '\u0000' + (view.artist || '') : ''
+  const prev = s.phone
+  const pausedSince = view.playing ? null : prev && prev.track === track && prev.pausedSince !== null ? prev.pausedSince : now
+  s.phone = { version: view.version, title: view.title, track, playing: !!view.playing, pausedSince }
+  const follow = !!track && (view.playing || (s.source === 'phone' && now - pausedSince < PHONE_IDLE_MS))
+  if (!follow) {
+    if (s.source === 'phone') leavePhone(s)
+    return false
+  }
+  if (s.source !== 'phone' || !s.song || s.phoneTrack !== track) {
+    s.source = 'phone'
+    s.phoneTrack = track
+    s.inflight = null // whatever the mic asked about is moot now
+    s.song = {
+      id: view.songId || null,
+      title: view.title || '',
+      artist: view.artist || '',
+      album: '',
+      durationMs: view.durationMs || null,
+      kind: 'pending',
+      lines: [],
+      lyricsVersion: null,
+      words: null,
+      envelope: null,
+      fast: true,
+    }
+    clock.reset(s.clock)
+    s.nextLyricsAt = view.songId ? now : Infinity
+    emit(s, 'song', { title: s.song.title, artist: s.song.artist, source: 'phone' })
+  } else if (view.songId && s.song.id !== view.songId) {
+    s.song.id = view.songId // the server has worked out which song it is: lyrics next
+    s.nextLyricsAt = now
+  } else if (view.songId && s.song.kind === 'pending') {
+    s.nextLyricsAt = now // something changed on the server: its lyrics may have come
+  }
+  if (view.durationMs) s.song.durationMs = view.durationMs
+  const before = clock.isKnown(s.clock) ? clock.songAt(s.clock, now) : null
+  const wasPaused = clock.isKnown(s.clock) && clock.isPaused(s.clock)
+  clock.reset(s.clock)
+  clock.setRatePrior(s.clock, (view.speed || 1) - 1)
+  clock.addMatch(s.clock, now, view.positionMs)
+  if (!view.playing) clock.pause(s.clock, now)
+  if (before !== null && Math.abs(view.positionMs - before) > PHONE_SEEK_MS) emit(s, 'seek', { deltaMs: view.positionMs - before })
+  if (before !== null && wasPaused !== !view.playing) emit(s, view.playing ? 'resume' : 'pause', { at: now, source: 'phone' })
+  return true
+}
+
+// The phone stopped (or has been paused for a minute): the room decides again.
+function leavePhone(s) {
+  s.source = 'room'
+  s.phoneTrack = null
+  emit(s, 'ended', { title: s.song ? s.song.title : null, source: 'phone' })
+  s.song = null
+  clock.reset(s.clock)
+  activity.forgetTrack(s.act)
+  activity.markPlaying(s.act)
+  s.resumeCheck = null
+  s.comeback = null
+  s.doubt = null
+  s.check = null
+  s.nextLyricsAt = Infinity
+  s.nextIdentifyPacket = s.last + 1
+}
+
 // SELECT or a tap: check now. Paused or not, with or without a song: the person is the
 // judge that something is off, and nothing else would send audio while paused.
 export function checkNow(s, now) {
@@ -475,6 +557,14 @@ export function checkNow(s, now) {
 
 export function decide(s, now) {
   if (s.inflight || s.noServer || now < s.holdUntil) return null
+  if (s.source === 'phone') {
+    // The phone says where the song is: only lyrics and word timings are asked for.
+    if (now >= s.nextLyricsAt && s.song && s.song.id) {
+      s.nextLyricsAt = Infinity
+      return request(s, 'lyrics', 'words', -1, -1, now)
+    }
+    return null
+  }
   if (s.wantCheck && s.mode !== 'takes' && s.last >= VERIFY_PACKETS - 1) {
     s.wantCheck = false
     const n = !s.song || clock.isPaused(s.clock) || !s.song.fast ? IDENTIFY_PACKETS : VERIFY_PACKETS

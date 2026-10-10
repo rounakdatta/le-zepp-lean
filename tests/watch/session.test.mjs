@@ -392,6 +392,60 @@ test('a song whose lyrics are still being looked up shows at once, and its lyric
   assert.equal(s.song.lines.length, 2)
 })
 
+// ---- the phone's own player (the LeZeppLean helper, via the server) ----
+
+const onPhone = (s, now, v) => session.onPhone(s, { version: v.version, title: 'Wonderwall', artist: 'Oasis', durationMs: 258_000, playing: true, positionMs: 0, speed: 1, songId: 'wonderwall', ...v }, now)
+
+test('music on the phone is followed exactly: where it is, when it pauses, when it is dragged', () => {
+  const s = session.createSession()
+  assert.equal(onPhone(s, 10_000, { version: 1, positionMs: 30_000 }), true)
+  assert.equal(s.source, 'phone')
+  assert.equal(Math.round(session.position(s, 12_000)), 32_000, 'runs with the player')
+  onPhone(s, 15_000, { version: 2, playing: false, positionMs: 35_000 })
+  assert.equal(Math.round(session.position(s, 20_000)), 35_000, 'frozen where the player paused')
+  onPhone(s, 21_000, { version: 3, positionMs: 35_000 })
+  assert.equal(Math.round(session.position(s, 22_000)), 36_000)
+  onPhone(s, 23_000, { version: 4, positionMs: 90_000 })
+  assert.equal(Math.round(session.position(s, 23_500)), 90_500, 'dragged on the phone: followed')
+  const types = session.takeEvents(s).map((e) => e.type)
+  assert.deepEqual(types.filter((t) => t !== 'synced'), ['song', 'pause', 'resume', 'seek'])
+})
+
+test('a track the server is still working out shows at once; its lyrics are asked for once it is known', () => {
+  const s = session.createSession()
+  onPhone(s, 1000, { version: 1, songId: null, positionMs: 5000 })
+  assert.equal(s.song.title, 'Wonderwall')
+  assert.equal(session.decide(s, 1500), null, 'nothing to ask yet')
+  onPhone(s, 2000, { version: 2, songId: 'wonderwall', positionMs: 6000 })
+  const req = session.decide(s, 2100)
+  assert.equal(req && req.kind, 'lyrics')
+  assert.equal(req.song, 'wonderwall')
+})
+
+test('while the phone plays, the room changes nothing', () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, positionMs: 30_000 })
+  const reqs = feed(s, 0, 200, () => QUIET)
+  assert.deepEqual(reqs, [], 'no requests from the mic')
+  assert.ok(!clock.isPaused(s.clock), 'a quiet room does not pause music in earphones')
+  s.mode = 'takes'
+  assert.equal(session.takeRequest(s, 300, 383, 18_000, 23_000), null)
+})
+
+test('a new track on the phone is a new song; a minute paused, the room is listened to again', () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, positionMs: 30_000 })
+  onPhone(s, 5000, { version: 2, title: 'Champagne Supernova', songId: 'champagne', positionMs: 0 })
+  assert.equal(s.song.title, 'Champagne Supernova')
+  assert.equal(Math.round(session.position(s, 6000)), 1000)
+  onPhone(s, 10_000, { version: 3, title: 'Champagne Supernova', songId: 'champagne', playing: false, positionMs: 5000 })
+  session.onTick(s, 30_000)
+  assert.equal(s.source, 'phone', 'a short pause: still the phone')
+  session.onTick(s, 71_000)
+  assert.equal(s.source, 'room')
+  assert.equal(s.song, null)
+})
+
 // ---- review findings (2026-10-10): each of these failed before its fix ----
 
 test('an answer about audio from before a pause does not un-pause the lyrics', () => {
