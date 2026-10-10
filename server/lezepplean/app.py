@@ -45,7 +45,7 @@ import numpy as np
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from . import __version__, phone, track, zepp_opus
+from . import __version__, phone, roman, track, zepp_opus
 from .align import MIN_LINE_CONFIDENCE
 from .lyrics import LyricsFinder
 from .prepare import Preparer
@@ -211,14 +211,59 @@ async def _lookup_lyrics(song: Song, length_ok: bool = True, retry_length: bool 
         song.words = {"status": "pending" if lyrics.kind == "synced" and song.reference_status != "unavailable" else "unavailable"}
         song.jobs = {k: v for k, v in song.jobs.items() if k == "assets"}
         song.lyrics_rev += 1
+    if new_lrc != song.lrc or song.script is None and new_lrc:
+        song.script = roman.script_of([t for _, t in new_lrc]) if lyrics.kind == "synced" else None
+        song.roman = None
+        song.roman_retry_at = 0.0
     song.lyrics_kind = lyrics.kind
     song.lrc = new_lrc
     song.lyrics_source = {"source": lyrics.source, "id": lyrics.source_id, "durationS": lyrics.duration_s}
     song.lyrics_retry_at = 0.0 if definite else time.time() + LYRICS_RETRY_S
+    _romanize_if_due(song)
     if not song.length_checked and lyrics.duration_s:
         # Apple didn't answer: LRCLIB's length, for now. Without any length the watch can't
         # tell when the song ends, and a gapless next song took 30-50 s to be noticed.
         song.duration_ms = round(lyrics.duration_s * 1000)
+
+
+_romanizing: set[str] = set()
+ROMAN_RETRY_S = (5, 15, 60)
+
+
+def _romanize_if_due(song: Song) -> None:
+    """Lyrics in a script the watch can't draw: write them in English letters, in the background."""
+    if song.script is None and song.lyrics_kind == "synced" and song.lrc:
+        song.script = roman.script_of([t for _, t in song.lrc])  # a song stored before this existed
+    if not song.script or song.roman or song.id in _romanizing or time.time() < song.roman_retry_at or not song.lrc:
+        return
+    _romanizing.add(song.id)
+
+    async def run() -> None:
+        try:
+            lrc = list(song.lrc)
+            for wait in (0,) + ROMAN_RETRY_S:
+                if wait:
+                    await asyncio.sleep(wait)
+                if song.lrc != lrc:
+                    return  # the lyrics changed meanwhile: their own turn comes
+                out = await roman.romanize(_http, [t for _, t in lrc], song.title, song.artist)
+                if out is not None:
+                    song.roman = out
+                    _store.put(song)
+                    log.info("%s romanized (%s, %d lines)", song.id, song.script, len(out))
+                    playing = _phone.now.song_id == song.id
+                    _preparer.ensure(song, _phone.position(time.time()) if playing else None)  # word timing, on these words
+                    if playing:
+                        _phone.bump()  # the watch asks for the lyrics when it hears of a change
+                    return
+            song.roman_retry_at = time.time() + 300
+            _store.put(song)
+        except Exception:
+            log.exception("romanizing %s failed", song.id)
+        finally:
+            _romanizing.discard(song.id)
+
+    asyncio.get_running_loop().create_task(run())
 
 
 _refreshing: set[str] = set()
@@ -255,6 +300,7 @@ async def _song_for(match, position_ms: float | None = None) -> Song:
     song = _store.get(song_id)
     if song is not None:
         _refresh_lyrics_if_due(song)
+        _romanize_if_due(song)
         return song
     song = Song(
         id=song_id, title=match.title, artist=match.artist, album=match.album,
@@ -359,6 +405,7 @@ async def lyrics(req: LyricsRequest, authorization: str | None = Header(None)) -
     if song is None:
         return {"ok": False, "reason": "unknown_song"}
     _refresh_lyrics_if_due(song)
+    _romanize_if_due(song)
     _preparer.ensure(song, None)
     return {"ok": True, "song": _song_info(song), **_song_data(song, req.known)}
 
@@ -432,6 +479,7 @@ async def _resolve_phone_track(track: tuple, app_id: str, title: str, artist: st
                 _phone.bump()  # the watch asks for the lyrics when it hears of a change
         else:
             _refresh_lyrics_if_due(song)
+            _romanize_if_due(song)
         _preparer.ensure(song, _phone.position(time.time()) if _phone.now.track == track else None)
     except Exception:
         log.exception("could not resolve %r by %r from the phone", title, artist)

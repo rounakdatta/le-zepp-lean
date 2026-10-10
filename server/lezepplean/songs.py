@@ -47,6 +47,9 @@ class Song:
     jobs: dict = field(default_factory=dict)       # {step: {tries, retryAt}} for steps that failed or were cut short
     lyrics_rev: int = 0                            # bumped when the lyrics change: word timings for older ones are dropped
     length_checked: bool = False                   # duration_ms came from Apple (the same-recording check was possible)
+    script: str | None = None                      # the lyrics' script when it isn't Latin (Devanagari, Bengali, ...)
+    roman: list | None = None                      # those lyrics in English letters, line for line (roman.py); None: not yet
+    roman_retry_at: float = 0.0                    # epoch s: the gateway failed; try again after this
     notes: list = field(default_factory=list)      # what went wrong, for /songs/<id>
 
 
@@ -57,7 +60,16 @@ def lyrics_payload(song: Song, min_confidence: float) -> dict:
     """
     words = (song.words or {}).get("lines") or {}
     lines = []
+    # A script the watch can't draw goes out in English letters (and is timed word by word
+    # in them); until those exist, "pending": the watch says "Loading lyrics…".
+    roman = song.roman if song.script and song.roman and len(song.roman) == len(song.lrc) else None
+    if song.script and roman is None and song.lyrics_kind == "synced":
+        body = {"kind": "pending", "lines": []}
+        version = hashlib.sha1(json.dumps(body, separators=(",", ":")).encode()).hexdigest()[:10]
+        return {"version": version, **body}
     for i, (start, text) in enumerate(song.lrc):
+        if roman is not None and text:
+            text = roman[i]
         w = words.get(str(i))
         if w and w[1] and w[3] >= min_confidence and len(w[1]) == len(text.split()):
             lines.append([int(w[0]), text, [int(x) for x in w[1]], int(w[2]) if w[2] is not None else None])
