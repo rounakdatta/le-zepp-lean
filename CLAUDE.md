@@ -190,7 +190,7 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 | Decision | Why |
 |---|---|
 | Music from speakers nearby, phone is Android | The user's choice. Earbud audio can't be heard by the watch mic, so a Spotify mode would be a separate feature |
-| ShazamIO, server on the user's Mac for now, then a lean homelab deploy (`server/Dockerfile`) | The user's choice |
+| ShazamIO; the server on the homelab (`charts/lezepplean`), the Mac only for working on it (`tools/serve.sh`) | The user's choice |
 | One continuous recording, read while written; takes only as a fallback | Takes leave 8 s gaps (mic-lock bug), so a pause could go unnoticed for 13 s |
 | Pause/resume decided on the watch from the SILK gain, backdated to the packet | No round trip: the lyrics stop within ~0.6 s and on the right word; a resume is confirmed by the server after 2 s of music |
 | Thresholds measured on real recordings until the room's floor is known, then relative to floor and music | Fixed thresholds failed in a room with a louder floor; relative ones from the start were more sensitive than the real recordings justify |
