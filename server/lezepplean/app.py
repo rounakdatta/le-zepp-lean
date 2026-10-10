@@ -1,8 +1,24 @@
 """HTTP API used by the watch app's phone-side service.
 
-POST /identify  body: {"audio": <base64 Zepp recorder file>, "clipMs": 5000, "client": {...diagnostics}}
+POST /identify  a watch recording: which song, and where in it the recording started
+POST /lyrics    a song's lyrics and word timings, when they have changed
 GET  /health    connectivity check used by the phone settings screen
+GET  /livez     liveness for the kubelet: no token, says nothing but "ok"
 GET  /recent    the last requests, for debugging from a browser
+GET  /songs, GET /songs/{id}   what the server knows, for debugging
+
+/identify body:
+    {"audio": <base64 Zepp recorder file>, "clipMs": 5000, "client": {...diagnostics},
+     "purpose": "find" | "sync" | "resume" | "check",
+     "song": <id the watch is following, or null>, "expectMs": <where the watch thinks
+     the recording started>, "known": {"lyrics": <version>, "envelope": <version>}}
+
+When the watch is following a song the server already has the audio of ("sync",
+"resume"), the recording is placed by comparing it with that audio near `expectMs`
+(track.py, a few ms). Otherwise, or if that comparison isn't convincing, Shazam decides.
+
+Lyrics and the loudness track are left out of the answer when the watch already has the
+same version: the phone link carries a few KB/s, and re-syncs come every 30 s.
 
 Set LEZEPPLEAN_TOKEN to require "Authorization: Bearer <token>" (do this before exposing
 the server through a public tunnel).
@@ -13,36 +29,75 @@ from __future__ import annotations
 import asyncio
 import audioop
 import base64
+import hashlib
 import json
 import logging
 import math
 import os
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+import numpy as np
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from . import __version__, zepp_opus
+from . import __version__, track, zepp_opus
+from .align import MIN_LINE_CONFIDENCE
 from .lyrics import LyricsFinder
+from .prepare import Preparer
 from .recognize import Recognizer
+from .reference import Mapping
+from .songs import Song, SongStore, lyrics_payload, words_status
 
 log = logging.getLogger("lezepplean")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+ROOT = Path(__file__).resolve().parent.parent
 TOKEN = os.environ.get("LEZEPPLEAN_TOKEN") or None
-CAPTURES = Path(os.environ.get("LEZEPPLEAN_CAPTURES", Path(__file__).resolve().parent.parent / "captures"))
+DATA = Path(os.environ.get("LEZEPPLEAN_DATA", ROOT / "data"))
+CAPTURES = Path(os.environ.get("LEZEPPLEAN_CAPTURES", ROOT / "captures"))
 KEEP_CAPTURES = int(os.environ.get("LEZEPPLEAN_KEEP_CAPTURES", "50"))
+# The captures are the user's room audio. Locally they are the fastest way to see what the
+# watch heard; on a shared server keep only the JSON summaries (LEZEPPLEAN_CAPTURE_AUDIO=0).
+CAPTURE_AUDIO = os.environ.get("LEZEPPLEAN_CAPTURE_AUDIO", "1") == "1"
+THREADS = int(os.environ.get("LEZEPPLEAN_THREADS", "2"))
 RECOGNIZE_TIMEOUT_S = 6.0  # the phone-side fetch is reported to be cut after ~10 s of silence
+LYRICS_RETRY_S = 120       # LRCLIB couldn't be asked properly: ask again after this
 
-app = FastAPI(title="LeZeppLean", version=__version__)
+# Fast re-sync must be sure before it overrules Shazam. Measured on simulated room
+# recordings (scripts/eval_track.py, scripts/sim_stream.py): a right placement scores
+# ~0.6-0.75; another song's best lag at most 0.41. The dangerous case is the *same* song at
+# the wrong place: with the clock 25 s off after a missed skip, the best lag near the
+# clock's guess scored 0.43 (Blinding Lights repeats itself), while the true place, found
+# by searching the whole song, scored 0.65. So both searches always run (the whole song
+# costs ~10 ms), and a near match is only trusted when nothing elsewhere beats it.
+TRACK_MIN_SCORE = 0.45
+TRACK_MIN_MARGIN = 0.08      # near search: best lag vs any lag 400 ms+ away (within +-3 s)
+TRACK_WIDE_BETTER = 0.10     # a place elsewhere this much better wins (the music was skipped)
+TRACK_TIE = 0.03             # within this, a repeat: the clock's guess breaks the tie
+TRACK_RADIUS_MS = 3000
+
 _http = httpx.AsyncClient(follow_redirects=True)
 _recognizer = Recognizer()
 _lyrics = LyricsFinder(_http)
+_store = SongStore(DATA / "songs")
+_preparer = Preparer(_store, _recognizer.recognize, threads=THREADS)
 _recent: deque[dict] = deque(maxlen=30)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    if os.environ.get("LEZEPPLEAN_WARM", "1") == "1":
+        _preparer.warm()  # the first song heard shouldn't wait for a process to start and models to load
+    yield
+    _preparer.close()
+
+
+app = FastAPI(title="LeZeppLean", version=__version__, lifespan=lifespan)
 
 
 class IdentifyRequest(BaseModel):
@@ -50,6 +105,15 @@ class IdentifyRequest(BaseModel):
     format: str = "zepp-opus"
     clipMs: int | None = None
     client: dict | None = None
+    purpose: str = "find"
+    song: str | None = None
+    expectMs: float | None = None
+    known: dict | None = None
+
+
+class LyricsRequest(BaseModel):
+    song: str
+    known: dict | None = None
 
 
 def _check_token(authorization: str | None) -> None:
@@ -67,11 +131,14 @@ def _level_dbfs(pcm: bytes) -> dict:
 
 
 def _save_capture(request_id: str, raw: bytes, wav: bytes | None, summary: dict) -> None:
+    if KEEP_CAPTURES <= 0:
+        return
     try:
         CAPTURES.mkdir(parents=True, exist_ok=True)
-        (CAPTURES / f"{request_id}.zepp.opus").write_bytes(raw)
-        if wav:
-            (CAPTURES / f"{request_id}.wav").write_bytes(wav)
+        if CAPTURE_AUDIO:
+            (CAPTURES / f"{request_id}.zepp.opus").write_bytes(raw)
+            if wav:
+                (CAPTURES / f"{request_id}.wav").write_bytes(wav)
         (CAPTURES / f"{request_id}.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False))
         files = sorted(CAPTURES.glob("*.json"))
         for old in files[:-KEEP_CAPTURES]:
@@ -81,16 +148,179 @@ def _save_capture(request_id: str, raw: bytes, wav: bytes | None, summary: dict)
         log.warning("could not save capture %s: %s", request_id, e)
 
 
+def _song_info(song: Song) -> dict:
+    return {"id": song.id, "title": song.title, "artist": song.artist, "album": song.album, "durationMs": song.duration_ms}
+
+
+def _song_data(song: Song, known: dict | None) -> dict:
+    """Lyrics and loudness track unless the watch has these versions, plus the words status."""
+    known = known or {}
+    out: dict = {}
+    payload = lyrics_payload(song, MIN_LINE_CONFIDENCE)
+    if known.get("lyrics") != payload["version"]:
+        out["lyrics"] = payload
+    if song.envelope and known.get("envelope") != song.envelope.get("version"):
+        out["envelope"] = song.envelope
+    w = words_status(song)
+    eta = _preparer.eta_ms(song)
+    if eta is not None:
+        w["etaMs"] = eta
+    out["words"] = w
+    # Whether a short window can be placed (the song's own audio is here): the watch sends
+    # 2-3 s when it can, 5 s (enough for Shazam) when it can't.
+    out["sync"] = {"fast": song.reference_status == "ready" and (_store.dir(song.id) / "features.npy").exists()}
+    return out
+
+
+async def _lookup_lyrics(song: Song, length_ok: bool = True, retry_length: bool = False) -> None:
+    """(Re)fill a song's lyrics from LRCLIB. A failed lookup is not saved as "no lyrics":
+    v0.1 never cached "none", and a stored "none" would have been forever. Neither are lyrics
+    picked without the track's length (iTunes failed): they may be timed for a remix."""
+    if retry_length and not song.length_checked and song.apple_id:
+        duration_s, length_ok = await _lyrics.itunes_lookup(song.apple_id)
+        if duration_s:
+            song.duration_ms = round(duration_s * 1000)
+            song.length_checked = True
+    duration_s = song.duration_ms / 1000 if song.duration_ms and song.length_checked else None
+    lyrics = await _lyrics.find(song.title, song.artist, song.album, duration_s)
+    definite = lyrics.definite and length_ok
+    new_lrc = [[ms, " ".join(text.split())] for ms, text in lyrics.lines]  # one space: the watch splits on whitespace runs
+    if new_lrc != song.lrc:
+        # Different lyrics (or the first ones): any word timings were for the old lines, and a
+        # step still running for them must not write them in (lyrics_rev, see prepare._run).
+        song.words = {"status": "pending" if lyrics.kind == "synced" and song.reference_status != "unavailable" else "unavailable"}
+        song.jobs = {k: v for k, v in song.jobs.items() if k == "assets"}
+        song.lyrics_rev += 1
+    song.lyrics_kind = lyrics.kind
+    song.lrc = new_lrc
+    song.lyrics_source = {"source": lyrics.source, "id": lyrics.source_id, "durationS": lyrics.duration_s}
+    song.lyrics_retry_at = 0.0 if definite else time.time() + LYRICS_RETRY_S
+    if not song.length_checked and lyrics.duration_s:
+        # Apple didn't answer: LRCLIB's length, for now. Without any length the watch can't
+        # tell when the song ends, and a gapless next song took 30-50 s to be noticed.
+        song.duration_ms = round(lyrics.duration_s * 1000)
+
+
+_refreshing: set[str] = set()
+
+
+def _refresh_lyrics_if_due(song: Song) -> None:
+    """Ask LRCLIB again in the background (it can take 25 s when slow: the phone gives up
+    after 9.5). The retry time moves on first, so a second request doesn't start a second lookup."""
+    if not song.lyrics_retry_at or time.time() < song.lyrics_retry_at or song.id in _refreshing:
+        return
+    song.lyrics_retry_at = time.time() + LYRICS_RETRY_S
+    _store.put(song)
+    _refreshing.add(song.id)
+
+    async def refresh() -> None:
+        try:
+            fresh = _store.get(song.id)
+            if fresh is not None:
+                await _lookup_lyrics(fresh, length_ok=fresh.length_checked or not fresh.apple_id, retry_length=True)
+                _store.put(fresh)
+        except Exception:
+            log.exception("lyrics refresh for %s failed", song.id)
+        finally:
+            _refreshing.discard(song.id)
+
+    asyncio.get_running_loop().create_task(refresh())
+
+
+async def _song_for(match) -> Song:
+    """The stored song for a Shazam match, created (with its lyrics) on first sight."""
+    # Shazam's key is stable per recording; without one, a hash of the names (never hash():
+    # it changes with every process, and the song would be "new" after each restart)
+    song_id = match.shazam_key or "t" + hashlib.sha1(f"{match.title}|{match.artist}".casefold().encode()).hexdigest()[:12]
+    song = _store.get(song_id)
+    if song is not None:
+        _refresh_lyrics_if_due(song)
+        return song
+    duration_s, length_ok = await _lyrics.itunes_lookup(match.apple_id)
+    song = Song(
+        id=song_id, title=match.title, artist=match.artist, album=match.album,
+        duration_ms=round(duration_s * 1000) if duration_s else None,
+        apple_id=match.apple_id, isrc=match.isrc, shazam_key=match.shazam_key,
+        length_checked=bool(duration_s),
+    )
+    await _lookup_lyrics(song, length_ok)
+    _store.put(song)
+    return song
+
+
+def _locate(song: Song, pcm: bytes, expect_ms: float | None, may_jump: bool) -> dict | None:
+    """Place the recording inside the song's own audio (fast re-sync), or None if unsure."""
+    feats = _store.features(song.id)
+    if feats is None or not song.reference:
+        return None
+    m = Mapping.from_dict(song.reference["map"])
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768
+    wide = track.locate(x, feats, None)
+    if wide is None:
+        return None
+    near = track.locate(x, feats, m.to_reference(expect_ms), TRACK_RADIUS_MS) if expect_ms is not None else None
+    found, method = None, None
+    if near is not None and abs(near.offset_ms - wide.offset_ms) < 400:
+        if near.score >= TRACK_MIN_SCORE and near.margin >= TRACK_MIN_MARGIN:
+            found, method = near, "track"                       # the clock was right, and nothing beats it
+    elif wide.score >= TRACK_MIN_SCORE + 0.05 and (near is None or wide.score >= near.score + TRACK_WIDE_BETTER):
+        if may_jump or near is None:
+            found, method = wide, "track-wide"                  # the music is somewhere else in the song
+    elif near is not None and near.score >= TRACK_MIN_SCORE + 0.05 and near.score >= wide.score - TRACK_TIE:
+        found, method = near, "track"                           # a repeat: near the clock's guess wins the tie
+    if found is None:
+        return None
+    return {"offsetMs": round(m.to_canonical(found.offset_ms), 1), "skew": m.b, "method": method,
+            "score": round(found.score, 3), "margin": round(found.margin, 3)}
+
+
+@app.get("/livez")
+async def livez() -> dict:
+    """For the kubelet's probes, which carry no token. /health needs one (it answers the
+    settings screen's "Test connection", which should fail on a wrong token)."""
+    return {"ok": True}
+
+
 @app.get("/health")
 async def health(authorization: str | None = Header(None)) -> dict:
     _check_token(authorization)
-    return {"ok": True, "service": "lezepplean", "version": __version__, "time": time.time()}
+    return {"ok": True, "service": "lezepplean", "version": __version__, "time": time.time(), "busy": _preparer.busy}
 
 
 @app.get("/recent")
 async def recent(authorization: str | None = Header(None)) -> list[dict]:
     _check_token(authorization)
     return list(_recent)
+
+
+@app.get("/songs")
+async def songs(authorization: str | None = Header(None)) -> list[dict]:
+    _check_token(authorization)
+    return [{**_song_info(s), "lyrics": s.lyrics_kind, "reference": s.reference_status, "words": words_status(s)}
+            for s in _store.all()]
+
+
+@app.get("/songs/{song_id}")
+async def song_detail(song_id: str, authorization: str | None = Header(None)) -> dict:
+    _check_token(authorization)
+    song = _store.get(song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="unknown song")
+    payload = lyrics_payload(song, MIN_LINE_CONFIDENCE)
+    return {**_song_info(song), "reference": song.reference, "referenceStatus": song.reference_status,
+            "words": {k: v for k, v in song.words.items() if k != "lines"}, "notes": song.notes,
+            "lyrics": payload, "envelope": bool(song.envelope)}
+
+
+@app.post("/lyrics")
+async def lyrics(req: LyricsRequest, authorization: str | None = Header(None)) -> dict:
+    _check_token(authorization)
+    song = _store.get(req.song)
+    if song is None:
+        return {"ok": False, "reason": "unknown_song"}
+    _refresh_lyrics_if_due(song)
+    _preparer.ensure(song, None)
+    return {"ok": True, "song": _song_info(song), **_song_data(song, req.known)}
 
 
 @app.post("/identify")
@@ -124,43 +354,54 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
                             **_level_dbfs(clip.pcm)}
         t = lap("decodeMs", t)
 
-        try:
-            match = await asyncio.wait_for(_recognizer.recognize(wav), RECOGNIZE_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            response.update(reason="recognizer_timeout")
-            return response
-        except Exception as e:  # ShazamIO is an unofficial client; surface its failures instead of a 500
-            log.exception("recognizer failed")
-            response.update(reason="recognizer_error", message=f"{type(e).__name__}: {e}")
-            return response
-        t = lap("recognizeMs", t)
+        song: Song | None = None
+        match: dict | None = None
+        if req.song and req.purpose in ("sync", "resume", "check"):
+            following = _store.get(req.song)
+            if following is not None:
+                # after a pause or a mismatch, the music may have been skipped anywhere in the song
+                match = await asyncio.to_thread(_locate, following, clip.pcm, req.expectMs, req.purpose in ("resume", "check", "sync"))
+                if match is not None:
+                    song = following
+                t = lap("trackMs", t)
+
         if match is None:
-            response.update(reason="no_match")
-            return response
+            try:
+                found = await asyncio.wait_for(_recognizer.recognize(wav), RECOGNIZE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                response.update(reason="recognizer_timeout")
+                return response
+            except Exception as e:  # ShazamIO is an unofficial client; surface its failures instead of a 500
+                log.exception("recognizer failed")
+                response.update(reason="recognizer_error", message=f"{type(e).__name__}: {e}")
+                return response
+            t = lap("recognizeMs", t)
+            if found is None:
+                response.update(reason="no_match")
+                return response
+            song = await _song_for(found)
+            match = {"offsetMs": round(found.offset_ms, 1), "skew": found.timeskew, "method": "shazam"}
+            t = lap("lyricsMs", t)
 
-        duration_s = await _lyrics.itunes_duration_s(match.apple_id)
-        lyrics = await _lyrics.find(match.title, match.artist, match.album, duration_s)
-        lap("lyricsMs", t)
-
-        response.update(
-            ok=True,
-            track={"title": match.title, "artist": match.artist, "album": match.album,
-                   "durationMs": round((duration_s or lyrics.duration_s or 0) * 1000) or None},
-            match={"offsetMs": round(match.offset_ms, 1), "skew": match.timeskew},
-            lyrics={"kind": lyrics.kind, "source": lyrics.source, "sourceId": lyrics.source_id,
-                    "lines": [[ms, text] for ms, text in lyrics.lines]},
-        )
+        # Roughly where the song will be when this answer reaches the watch: start of the
+        # recording + its length + the trip back. Used to align the lines about to be sung first.
+        _preparer.ensure(song, match["offsetMs"] + (clip.duration_ms or 0) + 3000)
+        known = req.known if req.known is not None and song.id == req.song else None
+        info = _song_info(song)
+        response.update(ok=True, song=info, track=info, match=match, **_song_data(song, known))
         return response
     finally:
         timing["totalMs"] = round((time.perf_counter() - started) * 1000)
         response["timing"] = timing
-        summary = {k: v for k, v in response.items() if k != "lyrics"}
+        summary = {k: v for k, v in response.items() if k not in ("lyrics", "envelope")}
         summary["lyricsLines"] = len((response.get("lyrics") or {}).get("lines") or [])
+        summary["sentEnvelope"] = "envelope" in response
         summary["client"] = req.client
+        summary["purpose"] = req.purpose
+        summary["expectMs"] = req.expectMs
         summary["clipMsClaimed"] = req.clipMs
         _recent.appendleft(summary)
         _save_capture(request_id, raw, wav, summary)
-        track = response.get("track") or {}
-        log.info("identify %s ok=%s reason=%s track=%r offset=%s lines=%s timing=%s client=%s",
-                 request_id, response["ok"], response.get("reason"), track.get("title"),
-                 (response.get("match") or {}).get("offsetMs"), summary["lyricsLines"], timing, req.client)
+        log.info("identify %s %s ok=%s reason=%s song=%r offset=%s method=%s timing=%s",
+                 request_id, req.purpose, response["ok"], response.get("reason"), (response.get("song") or {}).get("title"),
+                 (response.get("match") or {}).get("offsetMs"), (response.get("match") or {}).get("method"), timing)
