@@ -1,58 +1,8 @@
-// Pure timing logic: maps the watch clock to a position in the song. No Zepp APIs here,
-// so it runs unchanged under Node for tests.
+// Pure lyrics timing: which line and word to show at a song position, and when that next
+// changes. No Zepp APIs here, so it runs unchanged under Node for tests.
 //
-// Every recognition says "the clip you recorded started at song position offsetMs".
-// With the watch time at which that clip started, that gives one estimate of when the
-// song was at 0 ms, in watch time:  songStart = clipStartWatchMs - offsetMs.
-// The song position at any moment is then simply  now - songStart.
-
-// Two estimates further apart than this mean the music jumped (paused, seeked, restarted).
-export const JUMP_MS = 1500
-
-// While paused, `pausedAt` holds the watch time the music stopped, and the position stays
-// frozen there. Resuming shifts the song start (and every past estimate) by the pause length.
-export function createClock() {
-  return { start: null, samples: [], pausedAt: null }
-}
-
-export function addEstimate(clock, songStartMs, jumpMs = JUMP_MS) {
-  if (clock.start === null || Math.abs(songStartMs - clock.start) > jumpMs) {
-    clock.samples = [songStartMs]
-  } else {
-    clock.samples = clock.samples.concat([songStartMs]).slice(-5)
-  }
-  clock.start = median(clock.samples)
-  return clock
-}
-
-export function positionAt(clock, nowMs, adjustMs) {
-  const at = clock.pausedAt === null ? nowMs : clock.pausedAt
-  return at - clock.start + (adjustMs || 0)
-}
-
-export function pauseClock(clock, atWatchMs) {
-  if (clock.pausedAt === null) clock.pausedAt = atWatchMs
-  return clock
-}
-
-export function resumeClock(clock, atWatchMs) {
-  if (clock.pausedAt === null) return clock
-  const paused = Math.max(0, atWatchMs - clock.pausedAt)
-  clock.samples = clock.samples.map((s) => s + paused)
-  clock.start += paused
-  clock.pausedAt = null
-  return clock
-}
-
-export function isPaused(clock) {
-  return clock.pausedAt !== null
-}
-
-export function median(values) {
-  const sorted = values.slice().sort((a, b) => a - b)
-  const mid = sorted.length >> 1
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
-}
+// The song clock itself (matches, pauses, speed) lives in clock.js; this module only maps a
+// song position to what should be on screen.
 
 // lines: [[startMs, text], ...] sorted by startMs. Returns the index of the line being
 // sung at posMs, or -1 before the first line.
@@ -104,12 +54,29 @@ export function msUntilNextChange(lines, idx, posMs) {
   return next === null ? null : Math.max(0, next - posMs)
 }
 
-// What to show at song position posMs. The line appears lineLeadMs early so it can be read
-// before it is sung; each word lights up wordLeadMs early, just enough to cover drawing time.
-// Returns the line index, the highlighted word index (-1: none yet) and the ms until either
-// changes (null when nothing is left).
+// When line i takes over the screen. Normally lineLeadMs before it is sung, so it can be
+// read ahead. But if the line before it has word timings and its last word comes late, the
+// switch waits until that word has been lit for HOLD_LAST_WORD_MS: with a fixed 300 ms lead,
+// a word sung less than ~260 ms before the next line was never lit at all. The wait never
+// costs the new line its own first word (it still lights wordLeadMs early).
+const HOLD_LAST_WORD_MS = 180
+
+export function lineShownAt(lines, i, lineLeadMs, wordLeadMs) {
+  const at = lines[i][0] - lineLeadMs
+  const prev = lines[i - 1]
+  if (!prev || !prev[2] || !prev[2].length) return at
+  const lastLit = prev[2][prev[2].length - 1] - wordLeadMs + HOLD_LAST_WORD_MS
+  const latest = lines[i][0] - wordLeadMs - 20
+  return Math.max(at, Math.min(lastLit, latest))
+}
+
+// What to show at song position posMs: the line index, the highlighted word index (-1: none
+// yet) and the ms until either changes (null when nothing is left). A line appears early so it
+// can be read before it is sung (see lineShownAt); each word lights wordLeadMs early, just
+// enough to cover drawing time.
 export function displayAt(lines, posMs, lineLeadMs, wordLeadMs) {
-  const li = lineIndexAt(lines, posMs + lineLeadMs)
+  let li = lineIndexAt(lines, posMs + lineLeadMs)
+  while (li >= 0 && posMs < lineShownAt(lines, li, lineLeadMs, wordLeadMs)) li -= 1
   const words = li >= 0 ? lines[li][2] : null
   let wi = -1
   let next = null
@@ -124,9 +91,8 @@ export function displayAt(lines, posMs, lineLeadMs, wordLeadMs) {
       }
     }
   }
-  const nextLine = lines[li + 1]
-  if (nextLine) {
-    const at = nextLine[0] - lineLeadMs
+  if (li + 1 < lines.length) {
+    const at = lineShownAt(lines, li + 1, lineLeadMs, wordLeadMs)
     if (next === null || at < next) next = at
   }
   return { line: li, word: wi, waitMs: next === null ? null : Math.max(0, next - posMs) }

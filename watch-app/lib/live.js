@@ -7,15 +7,19 @@
 //
 // Packet timing: packet k covers watch time [origin + 60k, origin + 60(k+1)). `origin` is
 // estimated from when packets become readable: at any poll, packet `count` hasn't been
-// written yet, so origin <= now - 60 * count. The tightest of those bounds is the estimate.
+// written yet, so origin <= now - 60 * count. The tightest of those bounds over the last
+// ORIGIN_WINDOW_MS is the estimate. (The tightest since the start would never move again:
+// a recorder clock a little slow, or a dropped frame, would date every later packet early,
+// and every re-sync would inherit it.)
 import { create, id, codec } from '@zos/media'
 import { statSync, openSync, readSync, closeSync, rmSync, readdirSync, O_RDONLY } from '@zos/fs'
-import { createPacketStream, feed } from './stream'
-import { silkLevel } from './silk'
+import { createPacketStream, feed } from './stream.js'
+import { silkLevel } from './silk.js'
 
 export const PACKET_MS = 60
 const POLL_MS = 100
 const PROBE_MS = 4500
+const ORIGIN_WINDOW_MS = 30000
 const SETTLE_POLL_MS = 150
 const SETTLE_MAX_MS = 2500
 
@@ -47,9 +51,11 @@ export function startLive(handlers) {
     stream: createPacketStream(140),
     read: 0,
     origin: Infinity,
+    bounds: [], // [pollTime, bound] over the last ORIGIN_WINDOW_MS, bound increasing (a monotonic queue)
     progressive: false,
     growths: 0,
     firstGrowthMs: null,
+    lastGrowthAt: 0, // watch time new bytes last appeared (the page's watchdog reads it)
     probe: [], // first polls: [ms since start, file size] (sent to the server as diagnostics)
     timer: null,
     stopped: false,
@@ -77,12 +83,13 @@ function poll(live, handlers) {
     if (chunk) {
       live.read += chunk.length
       live.growths += 1
+      live.lastGrowthAt = now
       if (live.firstGrowthMs === null) live.firstGrowthMs = now - live.startedAt
       feed(live.stream, chunk, (bytes, index) => {
         const level = silkLevel(bytes, 0, bytes.length)
         handlers.onPacket(index, level ? level.gain : null, bytes)
       })
-      live.origin = Math.min(live.origin, now - PACKET_MS * live.stream.count)
+      updateOrigin(live, now, now - PACKET_MS * live.stream.count)
     }
   }
 
@@ -113,6 +120,14 @@ function poll(live, handlers) {
       })
     })
   }
+}
+
+function updateOrigin(live, now, bound) {
+  const q = live.bounds
+  while (q.length && q[q.length - 1][1] >= bound) q.pop()
+  q.push([now, bound])
+  while (q.length > 1 && q[0][0] < now - ORIGIN_WINDOW_MS) q.shift()
+  live.origin = q[0][1]
 }
 
 // Watch time at which packet `index` started.
