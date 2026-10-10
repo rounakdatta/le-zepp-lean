@@ -27,12 +27,18 @@ const FLOOR_PACKETS = 10 // quiet packets needed before the room floor is truste
 const AUDIBLE_MARGIN = 3 // expected level must clear the pause threshold by this to count as audible
 const OFFSET_PACKETS = 15 // loud packets needed before the song's track is trusted
 const TRACK_DROP = 8 // this far (~11 dB) below what the song's track predicts is quiet
+// A pause is dated from the first quiet packet of the stretch, forgiven ones included, unless
+// that stretch began longer ago than this (then it was a quiet passage of the song, and the
+// music stopped later). Restarting the count at every forgiven packet dated a stop 1.4 s late
+// when the song's track hovered around "audible" just after it.
+const FORGIVEN_SPAN_PACKETS = 25
 
 export function createActivity() {
   return {
     playing: true,
     run: 0, // consecutive packets pointing at a change of state
     runStart: -1, // packet index where that run began
+    quietFrom: -1, // first packet of the current quiet stretch, forgiven packets included (-1: not quiet)
     runSum: 0, // sum of the gains in a quiet run (seeds the floor when that run turns out to be a pause)
     musicLevel: MUSIC_LEVEL_GUESS, // typical gain while music plays (adapts)
     floor: 17, // typical gain while stopped (adapts once seen)
@@ -92,14 +98,15 @@ export function pushLevel(a, gain, packet, expected) {
       quiet = quiet || (gain < expected + a.offset - TRACK_DROP && gain < a.musicLevel - 5)
     }
     if (quiet) {
+      if (a.quietFrom < 0) a.quietFrom = packet
       if (audible === false) {
-        // The song is quiet here: a quiet room is what playing sounds like.
-        a.run = 0
+        // The song is quiet here: a quiet room is what playing sounds like. Not evidence of
+        // a pause, but not the end of the quiet stretch either.
         a.expectedQuiet += 1
         return null
       }
       if (a.run === 0) {
-        a.runStart = packet
+        a.runStart = packet - a.quietFrom <= FORGIVEN_SPAN_PACKETS ? a.quietFrom : packet
         a.runSum = 0
       }
       a.run += 1
@@ -113,10 +120,12 @@ export function pushLevel(a, gain, packet, expected) {
           a.floorN = 1
         }
         a.run = 0
+        a.quietFrom = -1
         return { type: 'pause', packet: a.runStart }
       }
     } else {
       a.run = 0
+      a.quietFrom = -1
       if (a.learn !== false) {
         a.musicLevel += (gain - a.musicLevel) * 0.05
         learnOffset(a, gain, expected)

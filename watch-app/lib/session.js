@@ -21,6 +21,27 @@ export const IDENTIFY_PACKETS = 84 // 5 s: what Shazam needs to be sure
 export const VERIFY_PACKETS = 50 // 3 s: enough to place audio inside a song the server knows
 export const RESUME_PACKETS = 34 // 2 s of the music after it comes back
 export const CHECK_PACKETS = 70 // 4.2 s after a suspected skip: enough for Shazam if it's another song
+// Takes mode: a take must be this long to be worth asking Shazam about (a 5 s take holds
+// ~78 packets: the mic starts ~0.32 s after start()), and this long to place inside a song
+// the server knows: fast re-sync was measured on 2 s windows, and on a T-Rex 3 the 1.56 s
+// left of a take after the music came back could not be placed.
+export const FIND_TAKE_PACKETS = 60
+export const PLACE_TAKE_PACKETS = 34
+// Takes mode: sound coming back during a pause moves the lyrics only once it is shown to be
+// the song, where it stopped. First on the watch: the room's loudness against the song's
+// own loudness track at the frozen position. In a simulated room, 1.4 s of the real song
+// there correlated 0.72 or more nine times in ten and placed it within one packet; someone
+// talking never passed 0.47. Shorter windows need more (talk reached 0.63 at 1 s).
+// Otherwise the server places it.
+const LOCAL_MIN_PACKETS = 17
+const LOCAL_FULL_PACKETS = 23
+const LOCAL_R_SHORT = 0.7
+const LOCAL_R = 0.6
+// Where the music is expected: the frozen position plus however long it has been back. It is
+// looked for this many packets either side (the freeze itself can be off by half a gap):
+// within +-0.6 s, 1.7 s of room loudness placed the song within a packet every time; within
+// +-1.5 s, only 80% of the time (a song's loudness repeats with its beat).
+const LOCAL_LAG = 10
 // No window is longer than this. live.js keeps 140 packets; a window stretched by a slow
 // phone (25 s timeout) or an error back-off used to reach past them, and the audio sent then
 // started up to 15 s after the time it was anchored to.
@@ -33,6 +54,9 @@ const VERIFY_MS = 30000
 const IDENTIFY_RETRY_PACKETS = 50 // ~3 s of new audio before trying again
 const DOUBT_BACKOFF_MAX = 8 // after a doubtful resume, re-checks space out: 5 s, 10 s, 20 s, ... 40 s
 const ERROR_BACKOFF_MS = 6000
+// The server answers a new song within 1.5 s, lyrics or not ("pending" while its lookup
+// runs): ask again this often until they come.
+const LYRICS_PENDING_POLL_MS = 1500
 const END_GRACE_MS = 2500
 const END_ZONE_MS = 5000 // music stopping this close to the end is the song ending, not a pause
 // The room keeps ringing after the music stops, so the first packet quiet enough to count
@@ -78,6 +102,10 @@ export function createSession() {
     playingFrom: 0, // first packet of the current stretch of music: no window reaches back past it
     track: [], // recent [packet, gain, expected gain] while playing, for skip detection
     match: { last: null, baseline: null, low: 0, checks: 0 },
+    takeSkip: null, // takes mode: why the last take stayed on the watch ('busy' | 'quiet' | null)
+    comeback: null, // takes mode: { from, failed } sound back during a pause, not yet shown to be the song
+    gapFrom: -1, // takes mode: the packets [gapFrom, gapTo] fell between two takes
+    gapTo: -2,
     misses: 0,
     matches: 0, // matches since the song started
     errors: 0,
@@ -109,6 +137,10 @@ function emit(s, type, extra) {
 // ---- input: packets ---------------------------------------------------------------
 
 export function onPacket(s, index, gain, at, now) {
+  if (s.last >= 0 && index > s.last + 1) {
+    s.gapFrom = s.last + 1
+    s.gapTo = index - 1
+  }
   s.last = index
   s.lastAt = at
   s.gains[index % MAX_GAINS] = gain
@@ -165,9 +197,9 @@ function followTrack(s, index, gain, at) {
   }
 }
 
-function correlation(a, b) {
+function correlation(a, b, minN) {
   const n = a.length
-  if (n < 20) return null
+  if (n < (minN || 20)) return null
   let ma = 0
   let mb = 0
   for (let i = 0; i < n; i++) {
@@ -191,8 +223,15 @@ function correlation(a, b) {
 }
 
 function onActivity(s, ev) {
-  const at = packetTime(s, ev.type === 'pause' ? ev.packet - PAUSE_TAIL_PACKETS : ev.packet)
+  let at = packetTime(s, ev.type === 'pause' ? ev.packet - PAUSE_TAIL_PACKETS : ev.packet)
+  if (ev.type === 'pause' && ev.packet === s.gapTo + 1) {
+    // The quiet began between two takes: somewhere between the last packet heard and this
+    // one. The middle is the best guess (dating it at this packet froze the lyrics up to
+    // 1.4 s late); placing the music when it comes back corrects it.
+    at = packetTime(s, Math.round((s.gapFrom - 1 + ev.packet) / 2) - PAUSE_TAIL_PACKETS)
+  }
   if (ev.type === 'pause') {
+    s.comeback = null // the sound that might have been the music has stopped again
     if (s.song && s.song.durationMs && clock.isKnown(s.clock) && !clock.isPaused(s.clock) &&
       clock.songAt(s.clock, at) > s.song.durationMs - END_ZONE_MS) {
       // The song finished: what comes next is a new song, not this one resuming.
@@ -212,6 +251,12 @@ function onActivity(s, ev) {
       s.stats.pauses += 1
       emit(s, 'pause', { at, packet: ev.packet })
     }
+    return
+  }
+  if (s.song && clock.isPaused(s.clock) && s.mode === 'takes') {
+    // Loud again: maybe the music, maybe someone talking. The lyrics stay where they are
+    // until takeRequest has shown it is the song (sound alone used to set them running).
+    s.comeback = { from: ev.packet, failed: false }
     return
   }
   if (s.song && clock.isPaused(s.clock)) {
@@ -282,13 +327,141 @@ function request(s, kind, purpose, from, to, now, startAtOverride) {
   return req
 }
 
-// Takes mode: the page records a take and sends all of it; this says what it is for.
+// Takes mode: will the next take probably go to the server? Then the page makes it long
+// enough to place (a resume to confirm, a re-sync due, a suspected skip, SELECT).
+export function wantsAudio(s, now) {
+  if (!s.song || s.wantCheck || s.check) return true
+  if (s.comeback) return s.comeback.failed || !s.song.envelope
+  if (s.resumeCheck && !clock.isPaused(s.clock)) return true
+  return isPlaying(s) && now >= s.nextVerifyAt
+}
+
+// Takes mode: the watch hands over a recording only when it stops, so the page records
+// takes back to back and feeds each through onPacket (that alone notices pauses and
+// resumes). This says whether a finished take [from, to] also goes to the server, and as
+// what. One request at a time: a take that finishes while one is out only feeds the
+// loudness. (Each take used to replace the request in flight; with takes every few seconds
+// a find whose lyrics took 6 s was replaced every time, and the song never appeared.)
 export function takeRequest(s, from, to, startAt, now) {
-  if (s.inflight) s.inflight = null // a take is never dropped: the previous answer is stale by now
-  let purpose = 'find'
-  if (s.song) purpose = clock.isKnown(s.clock) && clock.isPaused(s.clock) ? 'resume' : 'sync'
-  s.resumeCheck = null
-  return request(s, 'identify', purpose, from, to, now, startAt)
+  s.takeSkip = null
+  if (s.inflight || s.noServer || now < s.holdUntil) {
+    s.takeSkip = 'busy'
+    return null
+  }
+  if (s.wantCheck) {
+    s.wantCheck = false
+    const purpose = !s.song ? 'find' : clock.isPaused(s.clock) ? 'resume' : 'sync'
+    return request(s, 'identify', purpose, from, to, now, startAt)
+  }
+  if (!s.song) {
+    if (to - from + 1 >= FIND_TAKE_PACKETS && loudShare(s, from, to) >= LOUD_SHARE) {
+      return request(s, 'identify', 'find', from, to, now, startAt)
+    }
+    s.takeSkip = 'quiet'
+    return null
+  }
+  if (s.comeback && clock.isPaused(s.clock)) {
+    if (!s.comeback.failed) {
+      // This take alone: what came before it may be someone talking, or the gap before it.
+      const f = Math.max(from, s.comeback.from)
+      const v = placeLocally(s, f, to)
+      if (v && v.ok) {
+        resumeAt(s, v, now)
+        // and the server places the same audio exactly (it also catches a skip made while paused)
+        return v.n >= LOCAL_FULL_PACKETS ? request(s, 'identify', 'sync', f, to, now, startAt + (f - from) * PACKET_MS) : null
+      }
+      if (!v || v.n >= LOCAL_FULL_PACKETS) s.comeback.failed = true // the song's track can't say: ask the server
+    }
+    if (s.comeback.failed) {
+      const f = Math.max(from, s.comeback.from)
+      if (to - f + 1 >= PLACE_TAKE_PACKETS) {
+        s.comeback = null
+        return request(s, 'identify', 'resume', f, to, now, startAt + (f - from) * PACKET_MS)
+      }
+    }
+    return null
+  }
+  // The music came back: confirm it with the first take that is all music (the take it
+  // came back in also holds the silence before it, and its music part is too short).
+  if (s.resumeCheck && !clock.isPaused(s.clock)) {
+    if (from <= s.resumeCheck.from || to - from + 1 < (s.song.fast ? PLACE_TAKE_PACKETS : FIND_TAKE_PACKETS)) return null
+    s.resumeCheck = null
+    return request(s, 'identify', 'resume', from, to, now, startAt)
+  }
+  if (s.doubt && clock.isPaused(s.clock) && s.act.playing && s.last >= s.doubt.due) {
+    return request(s, 'identify', 'resume', from, to, now, startAt)
+  }
+  if (to - from + 1 < PLACE_TAKE_PACKETS) return null // a 2 s take: loudness only
+  if (s.check && isPlaying(s)) {
+    s.check = null
+    return request(s, 'identify', 'check', from, to, now, startAt)
+  }
+  if (isPlaying(s) && now >= s.nextVerifyAt && loudShare(s, from, to) >= LOUD_SHARE) {
+    return request(s, 'identify', 'sync', from, to, now, startAt)
+  }
+  return null
+}
+
+// Takes mode: is the sound since `from` the song carrying on from where it stopped? The
+// room's loudness against the song's own track at the frozen position, allowing the music
+// to have come back a little early or, between two takes, up to ~1 s before it was heard.
+// null: no track to compare with (here, or not yet).
+function placeLocally(s, from, to) {
+  const env = s.song.envelope
+  if (!env) return null
+  const frozen = clock.songAt(s.clock, s.clock.pausedAt)
+  const t0 = packetTime(s, from)
+  // when the music came back: its first loud packet, or, if that came right after a gap,
+  // the middle of the gap
+  const c = s.comeback.from
+  const onset = c === s.gapTo + 1 && c > from - 1 ? packetTime(s, Math.round((s.gapFrom - 1 + c) / 2)) : packetTime(s, c)
+  const expect = Math.round((t0 - onset) / PACKET_MS)
+  const obs = []
+  const offs = []
+  for (let i = from; i <= to; i++) {
+    const g = s.gains[i % MAX_GAINS]
+    if (g === undefined || g === null || i - s.last >= MAX_GAINS || s.last - i >= MAX_GAINS) continue
+    if (i >= s.gapFrom && i <= s.gapTo) continue
+    obs.push(g)
+    offs.push(packetTime(s, i) - t0)
+  }
+  const n = obs.length
+  if (n < LOCAL_MIN_PACKETS) return { ok: false, n }
+  let best = { r: -2, lag: 0 }
+  for (let lag = expect - LOCAL_LAG; lag <= expect + LOCAL_LAG; lag++) {
+    const a = []
+    const b = []
+    for (let j = 0; j < n; j++) {
+      const e = expectedAt(env, frozen + lag * PACKET_MS + offs[j])
+      if (e === null) continue
+      a.push(obs[j])
+      b.push(e)
+    }
+    if (a.length < n * 0.8) continue
+    const r = correlation(a, b, LOCAL_MIN_PACKETS)
+    if (r !== null && r > best.r) best = { r, lag }
+  }
+  if (best.r === -2 || best.r === -1) return null // the track is flat here: it can't tell
+  const need = n >= LOCAL_FULL_PACKETS ? LOCAL_R : LOCAL_R_SHORT
+  return { ok: best.r >= need, r: best.r, lag: best.lag, n, at: t0, frozen }
+}
+
+// The music is back: the take starting at v.at is at song position frozen + lag packets.
+// Run the lyrics from there.
+function resumeAt(s, v, now) {
+  const at = Math.max(s.clock.pausedAt + 1, v.at - v.lag * PACKET_MS)
+  clock.resume(s.clock, at)
+  s.comeback = null
+  s.provisional = false
+  s.doubt = null
+  s.quietAt = null
+  s.retries = 0
+  s.playingFrom = s.last
+  s.track = []
+  activity.markPlaying(s.act)
+  s.nextVerifyAt = now
+  s.stats.resumes += 1
+  emit(s, 'resume', { at, verified: 'local', r: Math.round(v.r * 100) / 100, lagMs: v.lag * PACKET_MS })
 }
 
 // SELECT or a tap: check now. Paused or not, with or without a song: the person is the
@@ -545,6 +718,10 @@ function mergeSongData(s, res, now) {
     activity.forgetTrack(s.act)
   }
   if (res.sync) song.fast = !!res.sync.fast
+  if (song.kind === 'pending') {
+    s.nextLyricsAt = now + LYRICS_PENDING_POLL_MS
+    return
+  }
   if (res.words) {
     song.words = res.words
     const eta = res.words.etaMs || 8000

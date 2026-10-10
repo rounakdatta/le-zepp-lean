@@ -10,6 +10,10 @@
 //   - the recorder's file becomes readable in bursts (--flush-ms), polled every 100 ms
 //     (lib/live.js), and packet times are estimated the way live.js does;
 //   - the phone link: --ble-kbps of payload each way plus --base-ms per request.
+//   - or, with --takes, a recorder that only hands over a recording when it stops (a T-Rex 3
+//     on firmware 6.4.16.3): takes back to back, as page/home/index.js records them, each
+//     losing its first --take-start-ms to the mic starting, --take-gap-ms between one stop
+//     and the next start.
 // The server is real: Shazam, the reference audio, fast re-sync and word timings.
 import { readFileSync } from 'node:fs'
 import * as session from '../../watch-app/lib/session.js'
@@ -28,6 +32,10 @@ const POLL_MS = 100
 const BLE_BYTES_PER_MS = Number(args['ble-kbps'] || 4) // KB/s == bytes/ms
 const BASE_MS = Number(args['base-ms'] || 700)
 const T0 = 1_000_000 // watch time when recording starts
+const TAKES = args.takes !== undefined
+const TAKE_START_MS = Number(args['take-start-ms'] || 320)
+const SETTLE_MS = Number(args['settle-ms'] || 35) // the recorder's STOP event (~5 ms) + a 30 ms size check
+const TAKE_GAP_MS = SETTLE_MS + Number(args['take-gap-ms'] || 250) // stop -> next start
 const LINE_LEAD = 300
 const WORD_LEAD = 40
 
@@ -62,11 +70,25 @@ function truthAt(t) {
   return truth[i] + ((t - T0) - i * 60) * rate
 }
 
+// Packets [from, to] framed as the recorder writes them.
+function framedBytes(from, to) {
+  const parts = []
+  for (let i = from; i <= to; i++) {
+    const p = packets[i]
+    const framed = new Uint8Array(8 + p.length)
+    framed[3] = p.length & 255
+    framed[2] = (p.length >> 8) & 255
+    framed.set(p, 8)
+    parts.push(framed)
+  }
+  return Buffer.concat(parts)
+}
+
 async function send(req, now) {
   let body
   let path
   if (req.kind === 'identify') {
-    const w = windowBytes(stream, req.from, req.to + 1)
+    const w = TAKES ? { bytes: framedBytes(req.from, req.to), packets: req.to - req.from + 1 } : windowBytes(stream, req.from, req.to + 1)
     body = { audio: Buffer.from(w.bytes).toString('base64'), clipMs: w.packets * 60, purpose: req.purpose, song: req.song,
       expectMs: req.expectMs === null ? null : Math.round(req.expectMs), known: req.known, client: { source: 'simulate' } }
     path = '/identify'
@@ -92,16 +114,53 @@ async function send(req, now) {
 const pending = []
 function drain(now) {
   for (const e of session.takeEvents(s)) {
-    log.push({ t: now, type: e.type, packet: e.packet, deltaMs: e.deltaMs, at: e.at })
+    log.push({ t: now, type: e.type, packet: e.packet, deltaMs: e.deltaMs, at: e.at, r: e.r, lagMs: e.lagMs })
     if (e.type === 'song' || e.type === 'lyrics') lines = s.song ? s.song.lines : null
   }
   const next = session.decide(s, now)
   if (next) pending.push([next, now])
 }
 
-// packet readability: written in bursts every FLUSH_MS, seen at the next 100 ms poll
 const total = packets.length
-for (let poll = T0 + POLL_MS; poll <= T0 + total * 60 + 2000; poll += POLL_MS) {
+// Takes mode: what page/home/index.js does with each finished take.
+function takeMs(now) {
+  if (!s.song || !s.song.fast || s.doubt) return 5000
+  return session.wantsAudio(s, now) ? 3000 : 2000
+}
+let takes = 0
+function startTake(start) {
+  if (start > T0 + total * 60) return
+  const len = takeMs(start)
+  const stop = start + len
+  takes += 1
+  at(stop + SETTLE_MS, () => {
+    const first = Math.max(0, Math.ceil((start + TAKE_START_MS - T0) / 60))
+    const last = Math.min(total - 1, Math.floor((stop - T0) / 60) - 1)
+    const now = stop + SETTLE_MS
+    for (let i = first; i <= last; i++) {
+      const level = silkLevel(packets[i], 0, packets[i].length)
+      if (level) session.onPacket(s, i, level.gain, T0 + i * 60, now)
+    }
+    if (args['trace-takes']) {
+      let g = 0
+      for (let i = first; i <= last; i++) { const l = silkLevel(packets[i], 0, packets[i].length); g += l ? l.gain : 0 }
+      log.push({ t: now, type: 'take', first, last, gain: Math.round(g / Math.max(1, last - first + 1)) })
+    }
+    if (last >= first) {
+      const req = session.takeRequest(s, first, last, T0 + first * 60, now)
+      if (req) pending.push([req, now])
+    }
+    drain(now)
+  })
+  at(stop + TAKE_GAP_MS, () => startTake(stop + TAKE_GAP_MS))
+}
+if (TAKES) {
+  s.mode = 'takes'
+  startTake(T0)
+}
+
+// packet readability: written in bursts every FLUSH_MS, seen at the next 100 ms poll
+for (let poll = T0 + POLL_MS; !TAKES && poll <= T0 + total * 60 + 2000; poll += POLL_MS) {
   at(poll, () => {
     const readableUpTo = Math.min(total, Math.floor(Math.floor((poll - T0) / FLUSH_MS) * FLUSH_MS / 60))
     while (visible < readableUpTo) {
@@ -118,7 +177,7 @@ for (let poll = T0 + POLL_MS; poll <= T0 + total * 60 + 2000; poll += POLL_MS) {
 }
 // feed the session as packets become visible (separate pass keeps origin up to date first)
 let fed = 0
-for (let poll = T0 + POLL_MS; poll <= T0 + total * 60 + 2000; poll += POLL_MS) {
+for (let poll = T0 + POLL_MS; !TAKES && poll <= T0 + total * 60 + 2000; poll += POLL_MS) {
   at(poll + 0.5, () => {
     while (fed < visible) {
       const level = silkLevel(packets[fed], 0, packets[fed].length)
@@ -184,7 +243,8 @@ for (let i = 0; i < truth.length; i++) {
   if (!prev || prev.kind !== kind || jump) segments.push({ kind, start: T0 + i * 60, from: truth[i], skip: !!jump && !newSong, song: songOf[i], newSong })
 }
 console.log(`script: ${STREAM.script}`)
-console.log(`link model: ${BASE_MS} ms + ${BLE_BYTES_PER_MS} KB/s each way; recorder flushes every ${FLUSH_MS} ms`)
+console.log(`link model: ${BASE_MS} ms + ${BLE_BYTES_PER_MS} KB/s each way; ` +
+  (TAKES ? `takes back to back (${takes}), ${TAKE_START_MS} ms lost at each start, ${TAKE_GAP_MS} ms from stop to start` : `recorder flushes every ${FLUSH_MS} ms`))
 const firstSong = log.find((e) => e.type === 'song')
 console.log(`identified after ${fmt(firstSong ? firstSong.t - T0 : null)}`)
 for (let k = 1; k < segments.length; k++) {
@@ -241,6 +301,17 @@ if (args['trace-error']) {
 if (args['trace-match']) {
   console.log('loudness-track correlation (time: r):')
   console.log(matchTrace.map(([t, r]) => `${((t - T0) / 1000).toFixed(1)}:${r === null ? '-' : r.toFixed(2)}`).join(' '))
+}
+if (args['trace-takes']) {
+  const from = Number(args['trace-from'] || 0) * 1000 + T0
+  const to = Number(args['trace-to'] || 1e9) * 1000 + T0
+  for (const e of log) {
+    if (e.t < from || e.t > to) continue
+    const ts = ((e.t - T0) / 1000).toFixed(2)
+    if (e.type === 'take') console.log(`${ts} take packets ${((e.first * 60) / 1000).toFixed(2)}..${(((e.last + 1) * 60) / 1000).toFixed(2)} s gain ${e.gain}`)
+    else if (e.type !== 'request') console.log(`${ts} ${e.type}${e.packet !== undefined ? ' packet@' + ((e.packet * 60) / 1000).toFixed(2) + 's' : ''}${e.at !== undefined ? ' at ' + ((e.at - T0) / 1000).toFixed(2) + 's' : ''}${e.r !== undefined ? ' r ' + e.r + ' lag ' + e.lagMs : ''}`)
+    else console.log(`${ts} request ${e.purpose} ${e.method || e.reason || ''}`)
+  }
 }
 const reqs = log.filter((e) => e.type === 'request')
 console.log(`requests: ${reqs.length} (${reqs.map((r) => r.purpose + (r.method ? ':' + r.method : r.ok === false ? ':' + r.reason : '') + (r.matchErr !== null && r.matchErr !== undefined ? ' ' + r.matchErr + 'ms' : '')).join(', ')})`)

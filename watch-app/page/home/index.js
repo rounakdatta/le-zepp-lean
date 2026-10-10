@@ -7,9 +7,11 @@
 // names the song, says where in it the window started, and sends lyrics timed word by
 // word. Between those, the song clock (lib/clock.js) runs on its own.
 //
-// If this firmware only makes the recording readable once it stops, the page falls back
-// to separate 5-second takes, as v0.1 did: everything still works, pauses are just
-// noticed at the next take instead of at the next packet.
+// If this firmware only makes the recording readable once it stops (a T-Rex 3 on 6.4.16.3
+// does), the page records takes back to back instead: 5 s while looking for a song (what
+// Shazam needs), 2 s while following one, so a pause is noticed within ~2.5 s. Each take's
+// loudness goes through the session; its audio goes to the server only when the session
+// asks (a find, a due re-sync, a resume to confirm).
 //
 // Keys: SELECT = re-sync now, UP = lyrics earlier, DOWN = lyrics later,
 //       hold SELECT = diagnostics, BACK = exit. Tapping the screen also re-syncs.
@@ -41,8 +43,13 @@ const REQUEST_TIMEOUT_MS = 25000
 const TICK_MS = 200
 const HINT_MS = 8000 // the key hint shows when the first lyrics do, then gets out of the way
 // Takes (fallback when the recording can't be read while it's written)
-const TAKE_MS = 5000
-const TAKE_GAP_MS = 8000 // between one take's stop() and the next start(): quick re-takes can lock the mic
+const FIND_TAKE_MS = 5000
+const PLACE_TAKE_MS = 3000 // ~2.7 s of audio: enough to place inside a song the server knows
+const FOLLOW_TAKE_MS = 2000
+// Between one take's end and the next start(). Some watches lock the mic when it restarts
+// too soon; a T-Rex 3 (firmware 6.4.16.3) took 20 takes in a row with this gap, each a full
+// 28 packets, none empty (10 Oct 2026).
+const TAKE_GAP_MS = 250
 const STALL_MS = 4000 // live packets stopped arriving this long: the recording is stuck; switch to takes
 
 let page = null
@@ -51,10 +58,14 @@ let prefs = { adjustMs: 0 }
 let s = session.createSession()
 let mode = 'starting' // 'live' | 'takes'
 let live = null
-let takePacket = 0
+let takeOrigin = null // watch time of packet 0: takes are numbered by time, so their gaps are gaps
+let takeLast = -1
 let takeTimer = null
 let lastStopAt = 0
 let recording = false
+let recordingSince = 0
+let takeFailures = 0
+let takesSeen = 0
 let lineTimer = null
 let tickTimer = null
 let shown = { line: -2, word: -2, version: null }
@@ -135,8 +146,9 @@ function startListening() {
       diag.probe = take.probe
       s.mode = 'takes'
       lastStopAt = Date.now()
+      live = null // its recorder is finished: the watch has only one
       if (take.buffer && take.bytes) onTake(take)
-      else scheduleTake(TAKE_GAP_MS)
+      scheduleTake(TAKE_GAP_MS)
     }),
     onError: guard('onLiveError', (code, message) => {
       diag.problem = code + (message ? ': ' + message : '')
@@ -157,6 +169,14 @@ function scheduleTake(ms) {
   takeTimer = setTimeout(guard('take', takeNow), Math.max(0, ms))
 }
 
+// Long takes while looking (Shazam needs ~5 s); while following a song the server can
+// place, 3 s when the take will go to the server, else 2 s, so the music stopping is
+// heard soon after.
+function takeMs() {
+  if (!s.song || !s.song.fast || s.doubt) return FIND_TAKE_MS
+  return session.wantsAudio(s, Date.now()) ? PLACE_TAKE_MS : FOLLOW_TAKE_MS
+}
+
 function takeNow() {
   if (recording || mode !== 'takes') return
   const wait = lastStopAt + TAKE_GAP_MS - Date.now()
@@ -165,21 +185,28 @@ function takeNow() {
     return
   }
   recording = true
-  view.setListening(true)
+  recordingSince = Date.now()
   recordClip(
-    TAKE_MS,
+    takeMs(),
     guard('recorded', (rec) => {
       recording = false
       lastStopAt = Date.now()
-      view.setListening(false)
       if (rec.error) {
         diag.problem = rec.error
         refreshDebug()
-        scheduleTake(rec.error === 'empty_recording' ? TAKE_GAP_MS * 2 : TAKE_GAP_MS)
+        // The mic refused, or gave nothing: back off (0.5 s, 1, 2, 4, 8) instead of asking
+        // four times a second, and say so once it is clearly not a blip.
+        takeFailures += 1
+        if (takeFailures === 3 && !s.song) view.showMessage('Waiting for the microphone', 'Trying again…')
+        scheduleTake(Math.min(8000, 500 * Math.pow(2, takeFailures - 1)))
         return
       }
+      if (takeFailures >= 3 && !s.song) view.showMessage('Listening…', 'Hold the watch near the music')
+      takeFailures = 0
       onTake(rec)
+      scheduleTake(TAKE_GAP_MS)
     }),
+    (m) => logger.info(m),
   )
 }
 
@@ -190,18 +217,40 @@ function onTake(take) {
   const packets = []
   feed(stream, new Uint8Array(take.buffer), (bytes) => packets.push(bytes))
   const n = packets.length
+  if (!n) return
   const firstAt = take.stoppedAt - n * session.PACKET_MS
   const now = Date.now()
+  if (takeOrigin === null) takeOrigin = firstAt
+  const base = Math.max(takeLast + 1, Math.round((firstAt - takeOrigin) / session.PACKET_MS))
+  takeLast = base + n - 1
+  let gains = 0
   for (let i = 0; i < n; i++) {
     const level = silkLevel(packets[i], 0, packets[i].length)
-    if (level) session.onPacket(s, takePacket + i, level.gain, firstAt + i * session.PACKET_MS, now)
+    if (!level) continue
+    session.onPacket(s, base + i, level.gain, firstAt + i * session.PACKET_MS, now)
+    gains += level.gain
   }
-  const from = takePacket
-  takePacket += n + 1000 // a gap in the indices marks the gap between takes
+  logger.info('take: ' + n + ' packets, mean gain ' + Math.round(gains / n) + ', settled in ' + take.settleMs + ' ms')
+  if (++takesSeen <= 3) {
+    // does the mic need a moment after the app starts? (the first take has come out near-silent)
+    const g = []
+    for (let i = 0; i < n; i++) {
+      const level = silkLevel(packets[i], 0, packets[i].length)
+      g.push(level ? level.gain : '-')
+    }
+    logger.info('take ' + takesSeen + ' gains ' + g.join(' '))
+  }
   handleEvents()
-  const req = session.takeRequest(s, from, from + n - 1, firstAt, now)
-  req.take = { startedAt: take.startedAt, stoppedAt: take.stoppedAt } // its answer is anchored on this take, not the latest
-  send(req, take.buffer)
+  view.setListening(!s.song) // the ring's listening colour means "looking for a song"
+  const req = session.takeRequest(s, base, takeLast, firstAt, now)
+  if (!req) {
+    if (!s.song && s.takeSkip === 'quiet') view.showMessage('Listening…', 'Waiting for the music')
+    return
+  }
+  // its answer is anchored on this take (on its end: capture starts late, stop is exact)
+  req.take = { startedAt: take.startedAt, stoppedAt: take.stoppedAt }
+  if (req.purpose === 'find') view.showMessage('Identifying…', 'Checking what it just heard')
+  send(req, windowBytes(stream, req.from - base, req.to - base + 1).bytes.buffer)
 }
 
 // After any session input: draw what changed, and send what it asked for.
@@ -262,7 +311,6 @@ function onAnswer(req, res, roundTripMs) {
   const now = Date.now()
   session.onResponse(s, req, res, now)
   handleEvents()
-  if (mode === 'takes' && req.kind === 'identify') scheduleTake(TAKE_GAP_MS)
   const next = session.decide(s, now)
   if (next) send(next, null)
 }
@@ -299,7 +347,7 @@ function handleEvents() {
     } else if (e.type === 'problem') {
       view.setStatus(problemText(e.reason))
     } else if (e.type === 'miss' && !s.song) {
-      view.showMessage('Listening…', 'Not recognised yet — still trying')
+      view.showMessage('Listening…', 'Not recognised yet — trying again')
     }
   }
   if (events.length) {
@@ -343,6 +391,13 @@ function refresh() {
 
 function tick() {
   const now = Date.now()
+  if (recording && now - recordingSince > FIND_TAKE_MS + 10000) {
+    // A take that never reports back must not stop the listening for good.
+    logger.error('take never finished; starting another')
+    recording = false
+    lastStopAt = now
+    scheduleTake(TAKE_GAP_MS)
+  }
   if (mode === 'live' && live && live.lastGrowthAt && now - live.lastGrowthAt > STALL_MS) {
     // The recording stopped growing (the recorder gave up, or the file is stuck): carry on
     // with takes rather than sit there frozen with a "playing" song.
@@ -382,11 +437,8 @@ function resyncNow(reason) {
     startListening()
     return
   }
-  if (mode === 'takes') {
-    takeNow()
-    return
-  }
   const now = Date.now()
+  // Takes are recorded back to back anyway: in takes mode this sends the next one.
   afterSession(session.checkNow(s, now), now)
   diag.lastManual = reason
 }

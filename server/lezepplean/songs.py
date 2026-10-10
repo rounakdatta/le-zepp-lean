@@ -34,7 +34,7 @@ class Song:
     apple_id: str | None = None
     isrc: str | None = None
     shazam_key: str | None = None
-    lyrics_kind: str = "none"                      # synced | plain | none
+    lyrics_kind: str = "none"                      # synced | plain | none | pending (first lookup still running)
     lrc: list = field(default_factory=list)        # [[start_ms, text]] on the watch's timeline
     lyrics_source: dict = field(default_factory=dict)
     reference: dict | None = None                  # {videoId, title, channel, durationS, file, map: {...}}

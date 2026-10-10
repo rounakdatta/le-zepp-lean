@@ -11,10 +11,11 @@
 // ORIGIN_WINDOW_MS is the estimate. (The tightest since the start would never move again:
 // a recorder clock a little slow, or a dropped frame, would date every later packet early,
 // and every re-sync would inherit it.)
-import { create, id, codec } from '@zos/media'
+import { codec } from '@zos/media'
 import { statSync, openSync, readSync, closeSync, rmSync, readdirSync, O_RDONLY } from '@zos/fs'
 import { createPacketStream, feed } from './stream.js'
 import { silkLevel } from './silk.js'
+import { microphone, forgetMicrophone } from './recorder.js'
 
 export const PACKET_MS = 60
 const POLL_MS = 100
@@ -29,9 +30,11 @@ export function startLive(handlers) {
   const name = 'live-' + Date.now() + '.opus'
   let recorder
   try {
-    recorder = create(id.RECORDER)
+    recorder = microphone()
+    if (!recorder) throw new Error('the system gave no recorder')
     recorder.setFormat(codec.OPUS, { target_file: 'data://' + name })
   } catch (e) {
+    forgetMicrophone()
     handlers.onError('recorder_unavailable', String(e))
     return null
   }
@@ -39,6 +42,7 @@ export function startLive(handlers) {
   try {
     recorder.start()
   } catch (e) {
+    forgetMicrophone()
     handlers.onError('recorder_start_failed', String(e))
     return null
   }

@@ -67,6 +67,10 @@ CAPTURE_AUDIO = os.environ.get("LEZEPPLEAN_CAPTURE_AUDIO", "1") == "1"
 THREADS = int(os.environ.get("LEZEPPLEAN_THREADS", "2"))
 RECOGNIZE_TIMEOUT_S = 6.0  # the phone-side fetch is reported to be cut after ~10 s of silence
 LYRICS_RETRY_S = 120       # LRCLIB couldn't be asked properly: ask again after this
+# A song heard for the first time goes to the watch by then, its lyrics or not: LRCLIB has
+# taken 6.5 s, and the watch waited on "Listening…" all that time. Its lyrics follow on the
+# watch's next poll ("pending" until then).
+LYRICS_WAIT_S = 1.5
 
 # Fast re-sync must be sure before it overrules Shazam. Measured on simulated room
 # recordings (scripts/eval_track.py, scripts/sim_stream.py): a right placement scores
@@ -225,7 +229,7 @@ def _refresh_lyrics_if_due(song: Song) -> None:
     asyncio.get_running_loop().create_task(refresh())
 
 
-async def _song_for(match) -> Song:
+async def _song_for(match, position_ms: float | None = None) -> Song:
     """The stored song for a Shazam match, created (with its lyrics) on first sight."""
     # Shazam's key is stable per recording; without one, a hash of the names (never hash():
     # it changes with every process, and the song would be "new" after each restart)
@@ -234,16 +238,36 @@ async def _song_for(match) -> Song:
     if song is not None:
         _refresh_lyrics_if_due(song)
         return song
-    duration_s, length_ok = await _lyrics.itunes_lookup(match.apple_id)
     song = Song(
         id=song_id, title=match.title, artist=match.artist, album=match.album,
-        duration_ms=round(duration_s * 1000) if duration_s else None,
-        apple_id=match.apple_id, isrc=match.isrc, shazam_key=match.shazam_key,
-        length_checked=bool(duration_s),
+        apple_id=match.apple_id, isrc=match.isrc, shazam_key=match.shazam_key, lyrics_kind="pending",
     )
-    await _lookup_lyrics(song, length_ok)
     _store.put(song)
+    lookup = asyncio.get_running_loop().create_task(_first_lyrics(song, position_ms))
+    try:
+        await asyncio.wait_for(asyncio.shield(lookup), LYRICS_WAIT_S)
+    except asyncio.TimeoutError:
+        log.info("lyrics for %s still coming after %.1f s: answering with its name", song_id, LYRICS_WAIT_S)
     return song
+
+
+async def _first_lyrics(song: Song, position_ms: float | None) -> None:
+    """A new song's length (iTunes) and lyrics (LRCLIB). Its word timings can only be planned
+    once there are lyrics: if they came after the answer, start them here."""
+    asked = time.monotonic()
+    try:
+        duration_s, length_ok = await _lyrics.itunes_lookup(song.apple_id)
+        if duration_s:
+            song.duration_ms = round(duration_s * 1000)
+            song.length_checked = True
+        await _lookup_lyrics(song, length_ok)
+    except Exception:
+        log.exception("lyrics for %s failed", song.id)
+        song.lyrics_kind = "none"
+        song.lyrics_retry_at = time.time() + LYRICS_RETRY_S
+    _store.put(song)
+    if song.lyrics_kind == "synced" and position_ms is not None:
+        _preparer.ensure(song, position_ms + (time.monotonic() - asked) * 1000)
 
 
 def _locate(song: Song, pcm: bytes, expect_ms: float | None, may_jump: bool) -> dict | None:
@@ -377,7 +401,8 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
             if found is None:
                 response.update(reason="no_match")
                 return response
-            song = await _song_for(found)
+            # where the song will be when the answer reaches the watch (see ensure below)
+            song = await _song_for(found, found.offset_ms + (clip.duration_ms or 0) + 3000)
             match = {"offsetMs": round(found.offset_ms, 1), "skew": found.timeskew, "method": "shazam"}
             t = lap("lyricsMs", t)
 

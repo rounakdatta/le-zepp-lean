@@ -183,8 +183,9 @@ export function createView(options) {
       wordMode = false
       shownKey = null
       const synced = song.kind === 'synced'
-      setCurrent(synced ? GAP : 'No synced lyrics for this song', synced ? 40 : 30)
-      set(next, synced ? '' : 'Showing the title only')
+      const pending = song.kind === 'pending'
+      setCurrent(synced ? GAP : pending ? 'Loading lyrics…' : 'No synced lyrics for this song', synced ? 40 : 30)
+      set(next, synced || pending ? '' : 'Showing the title only')
       set(next2, '')
       showBar(true)
       this.setLineProgress(0)
