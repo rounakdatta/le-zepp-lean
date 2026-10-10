@@ -1,0 +1,12 @@
+# watch app build output and toolchain
+watch-app/node_modules/
+watch-app/dist/
+
+# server environment, secrets and recorded audio
+server/.venv/
+server/.token
+server/captures/
+__pycache__/
+.pytest_cache/
+
+.DS_Store
