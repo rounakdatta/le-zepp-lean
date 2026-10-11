@@ -121,7 +121,10 @@ function listenOnPhone() {
   if (Date.now() - listenedAt < LISTEN_EVERY_MS) return
   listenedAt = Date.now()
   const { token } = config()
-  fetch({ url: HELPER_URL, method: 'POST', headers: headers(token, true), body: '{}', timeout: 1500 }).catch(() => {})
+  // its answer is only logged: the watch's own search goes on either way
+  fetch({ url: HELPER_URL, method: 'POST', headers: headers(token, true), body: '{}', timeout: 1500 })
+    .then((res) => console.log('lezepplean: phone mic asked, helper answered ' + res.status))
+    .catch((e) => console.log('lezepplean: phone mic not reached: ' + ((e && e.message) || e)))
 }
 
 // Ask the server for changes (it holds the question up to 8 s), and pass each one to the
