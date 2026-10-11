@@ -111,14 +111,3 @@ export function lineProgress(lines, idx, posMs, songEndMs) {
   const end = lines[idx + 1] ? lines[idx + 1][0] : songEndMs || start + 4000
   return Math.min(1, Math.max(0, (posMs - start) / Math.max(1, end - start)))
 }
-
-// Where in watch time the clip really started. Capture tends to begin a little after
-// start() returns (the mic has to spin up), but ends promptly at stop(). So when the server
-// tells us how much audio was actually decoded, anchor on the stop time instead.
-export function clipStartMs(startedAt, stoppedAt, decodedMs) {
-  if (!decodedMs) return { at: startedAt, anchor: 'start', latencyMs: null }
-  const byStop = stoppedAt - decodedMs
-  const latency = byStop - startedAt
-  if (latency > -300 && latency < 1500) return { at: byStop, anchor: 'stop', latencyMs: latency }
-  return { at: startedAt, anchor: 'start', latencyMs: latency }
-}

@@ -201,25 +201,43 @@ function onPhoneView(pv, trip) {
   // the relay's position is as of when it sent it; it has been on its way since
   const late = trip !== null ? trip / 2 : bleOneWayMs
   const v = pv.playing ? Object.assign({}, pv, { positionMs: pv.positionMs + late * (pv.speed || 1) }) : pv
-  const following = session.onPhone(s, v, now)
-  if (following && mode !== 'phone') {
-    // The phone is the clock now: no recordings (music in earphones can't be heard anyway).
-    mode = 'phone'
-    clearTimeout(takeTimer)
-    if (live) {
-      stopLive(live)
-      live = null
-    }
-    diag.mode = 'phone'
-  } else if (!following && mode === 'phone') {
-    mode = 'starting'
-    view.showMessage('Listening…', 'Hold the watch near the music')
-    startListening()
-  }
+  session.onPhone(s, v, now)
   handleEvents()
   refresh()
   const next = session.decide(s, now)
   if (next) send(next, null)
+}
+
+// The recorder follows the session: off while the phone is the clock (music in earphones
+// can't be heard anyway), back on when the session returns to the room, whatever moved it
+// (a minute paused is noticed by the session's own clock, with no word from the phone).
+// It comes back the way this watch records, after the usual gap, and never over a take
+// still recording: the watch has one recorder.
+function followSource() {
+  if (s.source === 'phone') {
+    if (mode === 'phone') return
+    mode = 'phone'
+    diag.mode = 'phone'
+    clearTimeout(takeTimer)
+    if (live) {
+      stopLive(live)
+      live = null
+      lastStopAt = Date.now()
+    }
+    return
+  }
+  if (mode !== 'phone') return
+  view.showMessage('Listening…', 'Hold the watch near the music')
+  mode = s.mode === 'takes' ? 'takes' : 'starting'
+  diag.mode = mode
+  if (mode === 'takes') {
+    if (!recording) scheduleTake(TAKE_GAP_MS)
+    return
+  }
+  clearTimeout(takeTimer)
+  takeTimer = setTimeout(guard('listen', () => {
+    if (mode === 'starting' && !live) startListening()
+  }), Math.max(0, lastStopAt + TAKE_GAP_MS - Date.now()))
 }
 
 // Takes mode: record, hand the take to the session, wait, repeat.
@@ -306,8 +324,6 @@ function onTake(take) {
     if (!s.song && s.takeSkip === 'quiet') view.showMessage('Listening…', 'Waiting for the music')
     return
   }
-  // its answer is anchored on this take (on its end: capture starts late, stop is exact)
-  req.take = { startedAt: take.startedAt, stoppedAt: take.stoppedAt }
   if (req.purpose === 'find') view.showMessage('Identifying…', 'Checking what it just heard')
   send(req, windowBytes(stream, req.from - base, req.to - base + 1).bytes.buffer)
 }
@@ -361,12 +377,6 @@ function onAnswer(req, res, roundTripMs) {
   diag.serverMs = res.timing && res.timing.totalMs
   diag.method = res.match && res.match.method
   diag.reason = res.ok ? null : res.reason
-  if (req.take && res.clip && res.clip.ms && req.kind === 'identify') {
-    // The decoded length pins the take's real start (the mic starts ~0.33 s after start()).
-    const start = sync.clipStartMs(req.take.startedAt, req.take.stoppedAt, res.clip.ms)
-    req.startAt = start.at
-    diag.anchor = start.anchor
-  }
   const now = Date.now()
   session.onResponse(s, req, res, now)
   handleEvents()
@@ -414,6 +424,7 @@ function handleEvents() {
       view.showMessage('Listening…', 'Not recognised yet — trying again')
     }
   }
+  followSource()
   if (events.length) {
     refresh()
     refreshDebug()
@@ -429,7 +440,9 @@ function refresh() {
   const song = s.song
   if (!song || !clock.isKnown(s.clock)) return
   if (!song.lines.length) {
-    if (shown.line !== -3) {
+    // The title, and why there are no lines (still loading, or none to be had), redrawn when
+    // that changes: "Loading lyrics…" stayed up after the answer that there are none.
+    if (shown.line !== -3 || shown.version !== song.lyricsVersion) {
       view.showSong(song)
       shown = { line: -3, word: -2, version: song.lyricsVersion }
     }
