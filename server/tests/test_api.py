@@ -162,6 +162,29 @@ def test_a_slow_lrclib_does_not_hold_up_the_answer(api, monkeypatch):
     assert app_module._store.get("k1").lyrics_retry_at > time.time() + 60  # and a second request won't start a second lookup
 
 
+def test_a_slow_first_lyrics_lookup_sends_the_song_name_first_and_its_lyrics_after(api, monkeypatch):
+    import asyncio
+    import time
+
+    client, app_module, calls = api
+
+    async def slow(*_a):
+        await asyncio.sleep(3)
+        return Lyrics(kind="synced", lines=[(1000, "Hello world")], source="lrclib", source_id=7)
+
+    monkeypatch.setattr(app_module._lyrics, "find", slow)
+    t = time.perf_counter()
+    r = client.post("/identify", json={"audio": watch_file(music(5)), "purpose": "find"}).json()
+    assert time.perf_counter() - t < 2.5, "LRCLIB took 6.5 s once: the watch sat on Listening all that time"
+    assert r["ok"] and r["song"]["title"] == "Song"
+    assert r["lyrics"]["kind"] == "pending" and r["lyrics"]["lines"] == []
+    time.sleep(2.5)  # the lookup finishes in the background...
+    r2 = client.post("/lyrics", json={"song": "k1", "known": {"lyrics": r["lyrics"]["version"]}}).json()
+    assert r2["lyrics"]["kind"] == "synced" and r2["lyrics"]["lines"][0][1] == "Hello world"   # ...and the next poll brings it
+    # and word timing is planned from where the song is by then, not left for a later request
+    assert any(pos is not None and pos > 30_000 for sid, pos in calls["ensure"][1:]), calls["ensure"]
+
+
 def test_lyrics_chosen_without_the_track_length_are_checked_again(api, monkeypatch):
     client, app_module, _ = api
 
@@ -232,3 +255,13 @@ def test_the_kubelet_probe_needs_no_token_and_learns_nothing(api, monkeypatch):
     monkeypatch.setattr(app_module, "TOKEN", "s3cret")
     r = client.get("/livez")
     assert r.status_code == 200 and r.json() == {"ok": True}
+
+
+def test_the_address_in_a_browser_shows_what_this_is_and_nothing_else(api):
+    client, _, _ = api
+    page = client.get("/")
+    assert page.status_code == 200 and "LeZeppLean" in page.text and "/logo.png" in page.text
+    assert client.get("/logo.png").headers["content-type"] == "image/png"
+    assert client.get("/favicon.ico").headers["content-type"] == "image/png"
+    assert client.get("/docs").status_code == 404 and client.get("/openapi.json").status_code == 404
+    assert client.get("/recent").status_code in (200, 401)  # unchanged: the API is the API

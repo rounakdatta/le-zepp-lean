@@ -1,3 +1,5 @@
+<p align="center"><img src="brand/logo-512.png" width="160" alt="LeZeppLean: a zeppelin wearing headphones"></p>
+
 # LeZeppLean
 
 Time-synced lyrics for the music playing around you, word by word, on an Amazfit T-Rex 3 (Zepp OS 6).

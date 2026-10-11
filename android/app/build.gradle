@@ -1,0 +1,43 @@
+plugins {
+    id "com.android.application"
+}
+
+// Signed with the same key every time, so a new version installs over the old one (CI writes
+// the key from the repository's secrets; without it, a debug-signed build for checking).
+def keystore = rootProject.file("release.keystore")
+
+android {
+    namespace "club.taptappers.lezepplean.helper"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "club.taptappers.lezepplean.helper"
+        minSdk 26
+        targetSdk 35
+        versionCode 2
+        versionName "0.1.1"
+    }
+
+    signingConfigs {
+        release {
+            if (keystore.exists()) {
+                storeFile keystore
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias "lezepplean"
+                keyPassword System.getenv("KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig keystore.exists() ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

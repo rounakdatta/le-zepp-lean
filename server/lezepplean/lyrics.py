@@ -170,7 +170,9 @@ class LyricsFinder:
 
     async def _get_json(self, path: str, params: dict, errors: list[str]):
         try:
-            r = await self._client.get(LRCLIB + path, params=params, headers={"User-Agent": USER_AGENT}, timeout=5)
+            # LRCLIB has taken 7 s for a request it answered in 0.2 s a moment before; lookups
+            # run in the background now, so wait for it rather than call it a failure.
+            r = await self._client.get(LRCLIB + path, params=params, headers={"User-Agent": USER_AGENT}, timeout=12)
         except httpx.HTTPError as e:
             errors.append(f"{path}: {type(e).__name__}")
             return None

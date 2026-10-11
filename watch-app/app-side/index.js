@@ -1,5 +1,8 @@
 // Runs inside the Zepp app on the phone. The watch has no internet of its own, so this
-// relays each mic clip to the recognition server and hands the answer back.
+// relays each mic clip to the recognition server and hands the answer back. It also
+// follows what the phone itself is playing (the LeZeppLean helper app reports it to the
+// server) and tells the watch the moment that changes: music in earphones, followed
+// exactly, with no mic at all.
 import { BaseSideService, settingsLib } from '@zeppos/zml/base-side'
 import { DEFAULT_SERVER_URL, DEFAULT_TOKEN } from './defaults'
 
@@ -14,11 +17,31 @@ function config() {
   return { url, token }
 }
 
+// The scripts the person reads (the settings page's toggles): their songs come in their own
+// script; everything else in English letters.
+function readScripts() {
+  const out = []
+  ;['Devanagari', 'Bengali', 'Tamil', 'Malayalam', 'Kannada', 'Arabic'].forEach((s) => {
+    const v = settingsLib.getItem('read_' + s)
+    if (v === true || v === 'true') out.push(s)
+  })
+  return out
+}
+
 function headers(token, json) {
   const h = {}
   if (json) h['Content-Type'] = 'application/json'
   if (token) h.Authorization = 'Bearer ' + token
   return h
+}
+
+function get(path) {
+  const { url, token } = config()
+  if (!url) return Promise.reject(new Error('no server'))
+  return fetch({ url: url + path, method: 'GET', headers: headers(token, false), timeout: FETCH_TIMEOUT_MS }).then((res) => {
+    if (res.status >= 400) throw new Error('http ' + res.status)
+    return parseBody(res)
+  })
 }
 
 function parseBody(res) {
@@ -55,13 +78,57 @@ function identify(params) {
     song: params.song || null,
     expectMs: params.expectMs === undefined ? null : params.expectMs,
     known: params.known || null,
+    read: readScripts(),
     client: params.diag,
   })
 }
 
 // No audio: word timings (and the loudness track) for a song, if they have changed.
 function lyrics(params) {
-  return post('/lyrics', { song: params.song, known: params.known || null })
+  return post('/lyrics', { song: params.song, known: params.known || null, read: readScripts() })
+}
+
+// ---- what the phone is playing ----------------------------------------------------
+
+// The server's answer is its view as it sent it; it spends ~this long getting here.
+const SERVER_TO_PHONE_MS = 50
+// The watch says it is still there this often; without it, stop asking the server.
+const WATCH_GONE_MS = 60000
+
+let phone = { version: -1, view: null, at: 0 }
+let polling = false
+let lastWatchAt = 0
+
+// The phone's state as of now: the position moves on while it plays.
+function phoneNow() {
+  const v = phone.view
+  if (!v) return { version: -1, title: '' }
+  const ran = v.playing ? (Date.now() - phone.at + SERVER_TO_PHONE_MS) * (v.speed || 1) : 0
+  return Object.assign({}, v, { positionMs: Math.round(v.positionMs + ran), sentAt: Date.now() })
+}
+
+// Ask the server for changes (it holds the question up to 8 s), and pass each one to the
+// watch at once, for as long as the watch app is open.
+function followPhone(service) {
+  if (polling) return
+  polling = true
+  const next = () => {
+    if (Date.now() - lastWatchAt > WATCH_GONE_MS) {
+      polling = false
+      return
+    }
+    get('/phone/next?since=' + phone.version + '&wait=8')
+      .then((view) => {
+        if (view && typeof view.version === 'number') {
+          const changed = view.version !== phone.version
+          phone = { version: view.version, view, at: Date.now() }
+          if (changed) service.call({ method: 'phone', params: phoneNow() })
+        }
+        next()
+      })
+      .catch(() => setTimeout(next, 3000))
+  }
+  next()
 }
 
 function ping() {
@@ -87,6 +154,12 @@ AppSideService(
     onInit() {},
 
     onRequest(req, res) {
+      if (req.method === 'phone') {
+        lastWatchAt = Date.now()
+        followPhone(this)
+        res(null, phoneNow())
+        return
+      }
       const handler = req.method === 'identify' ? identify : req.method === 'lyrics' ? lyrics : null
       if (!handler) {
         res(null, { ok: false, reason: 'unknown_method' })

@@ -186,7 +186,9 @@ class Preparer:
 
         if not song.envelope and not waiting("assets"):
             self._push(song.id, "assets", 0, position_ms)
-        if song.lyrics_kind == "synced" and song.words.get("status") not in ("ready", "unavailable"):
+        # lyrics in a script the aligner (English letters) can't read wait for their romanization
+        waiting_roman = bool(song.script) and not song.roman
+        if song.lyrics_kind == "synced" and song.words.get("status") not in ("ready", "unavailable") and not waiting_roman:
             done = song.words.get("done") or []
             if position_ms is not None:
                 for priority, kind in ((1, "near"), (2, "next")):
@@ -280,7 +282,9 @@ class Preparer:
             self.store.put(song)
             log.info("assets for %s in %.1fs", song.id, time.perf_counter() - started)
             return
-        lrc_ref = [[m.to_reference(ms), text] for ms, text in song.lrc]
+        # timed word by word in the words the watch shows: English letters for other scripts
+        texts = song.roman if song.script and song.roman and len(song.roman) == len(song.lrc) else [t for _, t in song.lrc]
+        lrc_ref = [[m.to_reference(ms), text] for (ms, _), text in zip(song.lrc, texts)]
         if job.kind in REGIONS:
             a, b = REGIONS[job.kind]
             pos = job.position_ms or 0

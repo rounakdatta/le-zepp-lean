@@ -43,9 +43,10 @@ from pathlib import Path
 import httpx
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from . import __version__, track, zepp_opus
+from . import __version__, phone, roman, track, zepp_opus
 from .align import MIN_LINE_CONFIDENCE
 from .lyrics import LyricsFinder
 from .prepare import Preparer
@@ -67,6 +68,14 @@ CAPTURE_AUDIO = os.environ.get("LEZEPPLEAN_CAPTURE_AUDIO", "1") == "1"
 THREADS = int(os.environ.get("LEZEPPLEAN_THREADS", "2"))
 RECOGNIZE_TIMEOUT_S = 6.0  # the phone-side fetch is reported to be cut after ~10 s of silence
 LYRICS_RETRY_S = 120       # LRCLIB couldn't be asked properly: ask again after this
+# A song heard for the first time goes to the watch by then, its lyrics or not: LRCLIB has
+# taken 6.5 s, and the watch waited on "Listening…" all that time. Its lyrics follow on the
+# watch's next poll ("pending" until then).
+LYRICS_WAIT_S = 1.5
+# A song playing on the phone whose lyrics lookup failed (LRCLIB down or slow) is asked about
+# again this soon, while it plays, instead of in 2 minutes when the watch next asks: a first
+# lookup that failed left "Sorry if I Hurt You" without lyrics until someone asked again.
+PHONE_LYRICS_RETRY_S = (5, 10, 20, 40, 60)
 
 # Fast re-sync must be sure before it overrules Shazam. Measured on simulated room
 # recordings (scripts/eval_track.py, scripts/sim_stream.py): a right placement scores
@@ -86,6 +95,7 @@ _recognizer = Recognizer()
 _lyrics = LyricsFinder(_http)
 _store = SongStore(DATA / "songs")
 _preparer = Preparer(_store, _recognizer.recognize, threads=THREADS)
+_phone = phone.Phone()
 _recent: deque[dict] = deque(maxlen=30)
 
 
@@ -95,7 +105,37 @@ async def lifespan(_app):
     _preparer.close()
 
 
-app = FastAPI(title="LeZeppLean", version=__version__, lifespan=lifespan)
+# No /docs or /openapi.json: the API is for the watch's relay, and the page at / says what this is.
+app = FastAPI(title="LeZeppLean", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+STATIC = Path(__file__).resolve().parent / "static"
+HOME = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0E1931">
+<title>LeZeppLean</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+  html { background: #03030A; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; text-align: center;
+         background: linear-gradient(#0E1931, #03030A); color: #F8F4EB;
+         font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { padding: 48px 24px; max-width: 30rem; }
+  img { width: 128px; height: 128px; }
+  h1 { font-size: 28px; margin: 20px 0 6px; letter-spacing: 0.01em; }
+  p { margin: 0; color: #B9B3A8; }
+  a { color: #FE5641; text-decoration: none; }
+  a:hover, a:focus-visible { text-decoration: underline; }
+  .more { margin-top: 28px; font-size: 15px; }
+</style>
+<main>
+  <img src="/logo.png" alt="">
+  <h1>LeZeppLean</h1>
+  <p>Lyrics on your wrist, word by word, in time with the music around you or in your earphones.</p>
+  <p class="more"><a href="https://github.com/rounakdatta/le-zepp-lean">github.com/rounakdatta/le-zepp-lean</a></p>
+</main>
+</html>
+"""
 
 
 class IdentifyRequest(BaseModel):
@@ -107,11 +147,26 @@ class IdentifyRequest(BaseModel):
     song: str | None = None
     expectMs: float | None = None
     known: dict | None = None
+    read: list[str] | None = None  # scripts the person reads: their songs in their own script
+
+
+class PhoneUpdate(BaseModel):
+    """The phone's media session, from the LeZeppLean helper app (android/)."""
+    app: str = ""            # the player's package, e.g. com.spotify.music
+    title: str = ""
+    artist: str = ""
+    album: str | None = None
+    durationMs: float | None = None
+    state: str = "stopped"   # playing | paused | stopped | buffering
+    positionMs: float = 0.0  # where the track was at sentAt
+    speed: float = 1.0
+    sentAt: float | None = None  # the phone's clock, ms since 1970
 
 
 class LyricsRequest(BaseModel):
     song: str
     known: dict | None = None
+    read: list[str] | None = None  # scripts the person reads: their songs in their own script
 
 
 def _check_token(authorization: str | None) -> None:
@@ -150,11 +205,12 @@ def _song_info(song: Song) -> dict:
     return {"id": song.id, "title": song.title, "artist": song.artist, "album": song.album, "durationMs": song.duration_ms}
 
 
-def _song_data(song: Song, known: dict | None) -> dict:
-    """Lyrics and loudness track unless the watch has these versions, plus the words status."""
+def _song_data(song: Song, known: dict | None, read: list[str] | None = None) -> dict:
+    """Lyrics and loudness track unless the watch has these versions, plus the words status.
+    `read`: the scripts the person reads (the Zepp app's settings), for songs in other scripts."""
     known = known or {}
     out: dict = {}
-    payload = lyrics_payload(song, MIN_LINE_CONFIDENCE)
+    payload = lyrics_payload(song, MIN_LINE_CONFIDENCE, read)
     if known.get("lyrics") != payload["version"]:
         out["lyrics"] = payload
     if song.envelope and known.get("envelope") != song.envelope.get("version"):
@@ -189,14 +245,59 @@ async def _lookup_lyrics(song: Song, length_ok: bool = True, retry_length: bool 
         song.words = {"status": "pending" if lyrics.kind == "synced" and song.reference_status != "unavailable" else "unavailable"}
         song.jobs = {k: v for k, v in song.jobs.items() if k == "assets"}
         song.lyrics_rev += 1
+    if new_lrc != song.lrc or song.script is None and new_lrc:
+        song.script = roman.script_of([t for _, t in new_lrc]) if lyrics.kind == "synced" else None
+        song.roman = None
+        song.roman_retry_at = 0.0
     song.lyrics_kind = lyrics.kind
     song.lrc = new_lrc
     song.lyrics_source = {"source": lyrics.source, "id": lyrics.source_id, "durationS": lyrics.duration_s}
     song.lyrics_retry_at = 0.0 if definite else time.time() + LYRICS_RETRY_S
+    _romanize_if_due(song)
     if not song.length_checked and lyrics.duration_s:
         # Apple didn't answer: LRCLIB's length, for now. Without any length the watch can't
         # tell when the song ends, and a gapless next song took 30-50 s to be noticed.
         song.duration_ms = round(lyrics.duration_s * 1000)
+
+
+_romanizing: set[str] = set()
+ROMAN_RETRY_S = (5, 15, 60)
+
+
+def _romanize_if_due(song: Song) -> None:
+    """Lyrics in a script the watch can't draw: write them in English letters, in the background."""
+    if song.script is None and song.lyrics_kind == "synced" and song.lrc:
+        song.script = roman.script_of([t for _, t in song.lrc])  # a song stored before this existed
+    if not song.script or song.roman or song.id in _romanizing or time.time() < song.roman_retry_at or not song.lrc:
+        return
+    _romanizing.add(song.id)
+
+    async def run() -> None:
+        try:
+            lrc = list(song.lrc)
+            for wait in (0,) + ROMAN_RETRY_S:
+                if wait:
+                    await asyncio.sleep(wait)
+                if song.lrc != lrc:
+                    return  # the lyrics changed meanwhile: their own turn comes
+                out = await roman.romanize(_http, [t for _, t in lrc], song.title, song.artist)
+                if out is not None:
+                    song.roman = out
+                    _store.put(song)
+                    log.info("%s romanized (%s, %d lines)", song.id, song.script, len(out))
+                    playing = _phone.now.song_id == song.id
+                    _preparer.ensure(song, _phone.position(time.time()) if playing else None)  # word timing, on these words
+                    if playing:
+                        _phone.bump()  # the watch asks for the lyrics when it hears of a change
+                    return
+            song.roman_retry_at = time.time() + 300
+            _store.put(song)
+        except Exception:
+            log.exception("romanizing %s failed", song.id)
+        finally:
+            _romanizing.discard(song.id)
+
+    asyncio.get_running_loop().create_task(run())
 
 
 _refreshing: set[str] = set()
@@ -225,7 +326,7 @@ def _refresh_lyrics_if_due(song: Song) -> None:
     asyncio.get_running_loop().create_task(refresh())
 
 
-async def _song_for(match) -> Song:
+async def _song_for(match, position_ms: float | None = None) -> Song:
     """The stored song for a Shazam match, created (with its lyrics) on first sight."""
     # Shazam's key is stable per recording; without one, a hash of the names (never hash():
     # it changes with every process, and the song would be "new" after each restart)
@@ -233,17 +334,38 @@ async def _song_for(match) -> Song:
     song = _store.get(song_id)
     if song is not None:
         _refresh_lyrics_if_due(song)
+        _romanize_if_due(song)
         return song
-    duration_s, length_ok = await _lyrics.itunes_lookup(match.apple_id)
     song = Song(
         id=song_id, title=match.title, artist=match.artist, album=match.album,
-        duration_ms=round(duration_s * 1000) if duration_s else None,
-        apple_id=match.apple_id, isrc=match.isrc, shazam_key=match.shazam_key,
-        length_checked=bool(duration_s),
+        apple_id=match.apple_id, isrc=match.isrc, shazam_key=match.shazam_key, lyrics_kind="pending",
     )
-    await _lookup_lyrics(song, length_ok)
     _store.put(song)
+    lookup = asyncio.get_running_loop().create_task(_first_lyrics(song, position_ms))
+    try:
+        await asyncio.wait_for(asyncio.shield(lookup), LYRICS_WAIT_S)
+    except asyncio.TimeoutError:
+        log.info("lyrics for %s still coming after %.1f s: answering with its name", song_id, LYRICS_WAIT_S)
     return song
+
+
+async def _first_lyrics(song: Song, position_ms: float | None) -> None:
+    """A new song's length (iTunes) and lyrics (LRCLIB). Its word timings can only be planned
+    once there are lyrics: if they came after the answer, start them here."""
+    asked = time.monotonic()
+    try:
+        duration_s, length_ok = await _lyrics.itunes_lookup(song.apple_id)
+        if duration_s:
+            song.duration_ms = round(duration_s * 1000)
+            song.length_checked = True
+        await _lookup_lyrics(song, length_ok)
+    except Exception:
+        log.exception("lyrics for %s failed", song.id)
+        song.lyrics_kind = "none"
+        song.lyrics_retry_at = time.time() + LYRICS_RETRY_S
+    _store.put(song)
+    if song.lyrics_kind == "synced" and position_ms is not None:
+        _preparer.ensure(song, position_ms + (time.monotonic() - asked) * 1000)
 
 
 def _locate(song: Song, pcm: bytes, expect_ms: float | None, may_jump: bool) -> dict | None:
@@ -270,6 +392,23 @@ def _locate(song: Song, pcm: bytes, expect_ms: float | None, may_jump: bool) -> 
         return None
     return {"offsetMs": round(m.to_canonical(found.offset_ms), 1), "skew": m.b, "method": method,
             "score": round(found.score, 3), "margin": round(found.margin, 3)}
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def home() -> str:
+    """What this is, for anyone who opens the address in a browser."""
+    return HOME
+
+
+@app.get("/logo.png", include_in_schema=False)
+async def logo() -> FileResponse:
+    return FileResponse(STATIC / "logo.png", media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/favicon.png", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(STATIC / "favicon.png", media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/livez")
@@ -317,8 +456,84 @@ async def lyrics(req: LyricsRequest, authorization: str | None = Header(None)) -
     if song is None:
         return {"ok": False, "reason": "unknown_song"}
     _refresh_lyrics_if_due(song)
+    _romanize_if_due(song)
     _preparer.ensure(song, None)
-    return {"ok": True, "song": _song_info(song), **_song_data(song, req.known)}
+    return {"ok": True, "song": _song_info(song), **_song_data(song, req.known, req.read)}
+
+
+@app.post("/phone")
+async def phone_update(req: PhoneUpdate, authorization: str | None = Header(None)) -> dict:
+    """The helper app on the phone: what its player is playing, the moment that changes."""
+    _check_token(authorization)
+    t = time.time()
+    if _phone.update(req.model_dump(), t) and req.title:
+        snap = _phone.now
+        asyncio.get_running_loop().create_task(_resolve_phone_track(snap.track, snap.app, snap.title, snap.artist, snap.album, snap.duration_ms))
+    return {"ok": True, "version": _phone.now.version, "songId": _phone.now.song_id}
+
+
+@app.get("/phone/next")
+async def phone_next(since: int = -1, wait: float = 8.0, authorization: str | None = Header(None)) -> dict:
+    """The watch's relay asks what the phone is playing; when it already knows `since`, the
+    answer waits (up to 8 s: the phone's HTTP client drops a request after ~10 s) for a change."""
+    _check_token(authorization)
+    await _phone.wait(since, max(0.0, min(wait, 8.0)))
+    return _phone.view(time.time())
+
+
+def _song_by_name(title: str, artist: str, duration_ms: int | None) -> Song | None:
+    """A song already here under this name (heard in the room, or played on the phone before)."""
+    t, a = phone.name_key(title), phone.artist_key(artist)
+    if not t:
+        return None
+    best = None
+    for s in _store.all():
+        if phone.name_key(s.title) != t or phone.artist_key(s.artist) != a:
+            continue
+        if duration_ms and s.duration_ms and abs(s.duration_ms - duration_ms) > 3000:
+            continue  # another recording of it (a live version, an edit): timed differently
+        if best is None or (s.lyrics_kind == "synced") > (best.lyrics_kind == "synced"):
+            best = s
+    return best
+
+
+async def _resolve_phone_track(track: tuple, app_id: str, title: str, artist: str, album: str | None, duration_ms: int | None) -> None:
+    """Which song the phone is playing, and its lyrics and word timings on their way."""
+    try:
+        if app_id == phone.YOUTUBE:
+            title, artist = phone.from_youtube(title, artist)
+        song = _song_by_name(title, artist, duration_ms)
+        if song is None:
+            key = f"{phone.name_key(title)}|{phone.artist_key(artist)}|{round((duration_ms or 0) / 1000)}"
+            song = Song(id="p" + hashlib.sha1(key.encode()).hexdigest()[:12], title=title, artist=artist, album=album,
+                        duration_ms=duration_ms, length_checked=bool(duration_ms), lyrics_kind="pending")
+            _store.put(song)
+        if _phone.now.track == track:
+            _phone.now.song_id = song.id
+            _phone.bump()
+        if song.lyrics_kind == "pending":
+            # the player's own length: the lyrics are timed for this recording or not at all
+            for wait in (0,) + PHONE_LYRICS_RETRY_S:
+                if wait:
+                    await asyncio.sleep(wait)
+                    if _phone.now.track != track:
+                        break  # another song now: it is looked up the next time it plays
+                await _lookup_lyrics(song, length_ok=bool(duration_ms))
+                if song.lyrics_kind == "synced" or not song.lyrics_retry_at:
+                    break  # found, or LRCLIB answered that it has none
+                song.lyrics_kind = "pending"  # LRCLIB couldn't be asked: still coming, not "none"
+                _store.put(song)
+            if song.lyrics_kind == "pending":
+                song.lyrics_kind = "none"
+            _store.put(song)
+            if _phone.now.track == track:
+                _phone.bump()  # the watch asks for the lyrics when it hears of a change
+        else:
+            _refresh_lyrics_if_due(song)
+            _romanize_if_due(song)
+        _preparer.ensure(song, _phone.position(time.time()) if _phone.now.track == track else None)
+    except Exception:
+        log.exception("could not resolve %r by %r from the phone", title, artist)
 
 
 @app.post("/identify")
@@ -377,7 +592,8 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
             if found is None:
                 response.update(reason="no_match")
                 return response
-            song = await _song_for(found)
+            # where the song will be when the answer reaches the watch (see ensure below)
+            song = await _song_for(found, found.offset_ms + (clip.duration_ms or 0) + 3000)
             match = {"offsetMs": round(found.offset_ms, 1), "skew": found.timeskew, "method": "shazam"}
             t = lap("lyricsMs", t)
 
@@ -386,7 +602,7 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
         _preparer.ensure(song, match["offsetMs"] + (clip.duration_ms or 0) + 3000)
         known = req.known if req.known is not None and song.id == req.song else None
         info = _song_info(song)
-        response.update(ok=True, song=info, track=info, match=match, **_song_data(song, known))
+        response.update(ok=True, song=info, track=info, match=match, **_song_data(song, known, req.read))
         return response
     finally:
         timing["totalMs"] = round((time.perf_counter() - started) * 1000)

@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .visual import reorder
+
 
 @dataclass
 class Song:
@@ -34,7 +36,7 @@ class Song:
     apple_id: str | None = None
     isrc: str | None = None
     shazam_key: str | None = None
-    lyrics_kind: str = "none"                      # synced | plain | none
+    lyrics_kind: str = "none"                      # synced | plain | none | pending (first lookup still running)
     lrc: list = field(default_factory=list)        # [[start_ms, text]] on the watch's timeline
     lyrics_source: dict = field(default_factory=dict)
     reference: dict | None = None                  # {videoId, title, channel, durationS, file, map: {...}}
@@ -47,18 +49,43 @@ class Song:
     jobs: dict = field(default_factory=dict)       # {step: {tries, retryAt}} for steps that failed or were cut short
     lyrics_rev: int = 0                            # bumped when the lyrics change: word timings for older ones are dropped
     length_checked: bool = False                   # duration_ms came from Apple (the same-recording check was possible)
+    script: str | None = None                      # the lyrics' script when it isn't Latin (Devanagari, Bengali, ...)
+    roman: list | None = None                      # those lyrics in English letters, line for line (roman.py); None: not yet
+    roman_retry_at: float = 0.0                    # epoch s: the gateway failed; try again after this
     notes: list = field(default_factory=list)      # what went wrong, for /songs/<id>
 
 
-def lyrics_payload(song: Song, min_confidence: float) -> dict:
+# Scripts the watch can draw (Indic ones with their letters reordered, visual.py); the rest
+# (Telugu, Gurmukhi, Gujarati, Odia: no glyphs at all) always go out in English letters.
+DRAWABLE = {"Devanagari", "Bengali", "Tamil", "Malayalam", "Kannada", "Arabic"}
+
+
+def lyrics_payload(song: Song, min_confidence: float, read: list[str] | None = None) -> dict:
     """Lines as the watch wants them: [startMs, text, wordStarts | null, endMs | null].
 
     Word timings only for lines the aligner is sure about; the rest stay line by line.
     """
     words = (song.words or {}).get("lines") or {}
     lines = []
+    # A script the person reads (and the watch can draw) goes out as it is written, its letters
+    # in the order the watch draws them. Any other goes out in English letters (and is timed
+    # word by word in them); until those exist, "pending": the watch says "Loading lyrics…".
+    native = bool(song.script and read and song.script in read and song.script in DRAWABLE)
+    roman = song.roman if song.script and song.roman and len(song.roman) == len(song.lrc) else None
+    if native:
+        roman = None
+    elif song.script and roman is None and song.lyrics_kind == "synced":
+        body = {"kind": "pending", "lines": []}
+        version = hashlib.sha1(json.dumps(body, separators=(",", ":")).encode()).hexdigest()[:10]
+        return {"version": version, **body}
     for i, (start, text) in enumerate(song.lrc):
+        if roman is not None and text:
+            text = roman[i]
+        elif native and text:
+            text = reorder(text, song.script)
         w = words.get(str(i))
+        if native and song.script == "Arabic":
+            w = None  # one widget per word would set Urdu's right-to-left words out left to right
         if w and w[1] and w[3] >= min_confidence and len(w[1]) == len(text.split()):
             lines.append([int(w[0]), text, [int(x) for x in w[1]], int(w[2]) if w[2] is not None else None])
         else:

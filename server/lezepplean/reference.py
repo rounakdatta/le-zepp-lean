@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .phone import name_key
 from . import zepp_opus
 
 log = logging.getLogger("lezepplean.reference")
@@ -174,7 +175,8 @@ async def measure_mapping(audio: np.ndarray, recognize, song_key: str | None, ti
     for start_s, match in results:
         if match is None:
             continue
-        same = (song_key and match.shazam_key == song_key) or (not song_key and match.title.casefold() == title.casefold())
+        # a song named by the phone's player has no Shazam key: then the name decides
+        same = (song_key and match.shazam_key == song_key) or (not song_key and name_key(match.title) == name_key(title))
         if same:
             xs.append(start_s * 1000)
             ds.append(match.offset_ms - start_s * 1000)
