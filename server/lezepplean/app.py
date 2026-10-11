@@ -565,6 +565,14 @@ async def _hear(rec: listen.Listening) -> None:
     log.info("the phone heard %s (%s)", song.id, rec.id)
 
 
+@app.get("/phone/recent")
+async def phone_recent(authorization: str | None = Header(None)) -> list[dict]:
+    """What the helper said lately, newest first: for working out why the watch did what it did."""
+    _check_token(authorization)
+    t = time.time()
+    return [{**h, "at": None, "agoS": round(t - h["at"], 1)} for h in reversed(_phone.history)]
+
+
 @app.get("/phone/next")
 async def phone_next(since: int = -1, wait: float = 8.0, authorization: str | None = Header(None)) -> dict:
     """The watch's relay asks what the phone is playing; when it already knows `since`, the

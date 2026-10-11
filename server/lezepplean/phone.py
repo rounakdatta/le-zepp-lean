@@ -38,6 +38,7 @@ class Snapshot:
     at: float = 0.0           # time.time()
     speed: float = 1.0
     updated: float = 0.0      # when the helper last spoke
+    stale: bool = False       # no word from the helper for STALE_S while its music played
     song_id: str | None = None
     track: tuple = field(default_factory=tuple)  # what identifies the track, to notice a new one
 
@@ -49,6 +50,7 @@ class Phone:
         self._lags: deque[float] = deque(maxlen=OFFSET_SAMPLES)
         self.heard: dict | None = None
         self.heard_at = 0.0
+        self.history: deque[dict] = deque(maxlen=60)  # what the helper said lately (GET /phone/recent)
 
     def clock(self, sent_ms, received: float) -> float:
         """Add this to a time on the phone's clock (ms) for the server's. The fastest delivery
@@ -78,14 +80,15 @@ class Phone:
         return s.position_ms + ((t - s.at) * 1000 * s.speed if s.playing else 0.0)
 
     def expire(self, t: float) -> None:
-        """A helper silent for STALE_S while "playing" (killed, or its phone asleep) isn't
-        trusted to be playing: its track is paused where it had got to by then, under a new
-        version, so that the watch hears of it (only the view used to say so, and the watch,
-        seeing no new version, followed the old one for good)."""
+        """A helper silent for STALE_S while its music played can't say what plays: Android
+        holds it back while the phone's screen is off (vivo especially), or it was killed. It is
+        marked stale, under a new version so the watch hears of it, and the music is taken to
+        play on: marked paused, as it was at first, the lyrics froze while YouTube Music played
+        on. Should the song then end with no word, the watch lets it go (session.js)."""
         s = self.now
-        if (s.playing or s.buffering) and t - s.updated > STALE_S:
-            at = s.updated + STALE_S
-            s.position_ms, s.at, s.playing, s.buffering = self.position(at), at, False, False
+        if (s.playing or s.buffering) and not s.stale and t - s.updated > STALE_S:
+            s.stale = True
+            self.history.append({"at": t, "state": "stale", "silentS": round(t - s.updated)})
             self.bump()
 
     def update(self, body: dict, received: float) -> bool:
@@ -94,6 +97,9 @@ class Phone:
         late_ms = 0.0
         if isinstance(sent, (int, float)) and sent > 0:
             late_ms = max(0.0, received * 1000 - sent - self.clock(sent, received))
+        self.history.append({"at": received, "state": str(body.get("state") or ""), "positionMs": round(float(body.get("positionMs") or 0)),
+                             "lagMs": round(received * 1000 - sent) if isinstance(sent, (int, float)) and sent > 0 else None,
+                             "app": str(body.get("app") or "")[:40], "title": str(body.get("title") or "")[:40]})
         title = str(body.get("title") or "").strip()
         artist = str(body.get("artist") or "").strip()
         app = str(body.get("app") or "")
@@ -108,7 +114,8 @@ class Phone:
         new_track = track != s.track
         moved = abs(position - self.position(received)) > 250
         changed = (new_track or playing != s.playing or buffering != s.buffering or (playing and moved)
-                   or (not playing and abs(position - s.position_ms) > 250))
+                   or (not playing and abs(position - s.position_ms) > 250) or s.stale)
+        s.stale = False  # it spoke
         s.app, s.title, s.artist, s.album = app, title, artist, (body.get("album") or None)
         s.duration_ms = duration
         s.playing, s.buffering, s.speed, s.position_ms, s.at, s.updated = playing, buffering, speed, position, received, received
@@ -130,7 +137,7 @@ class Phone:
         self.expire(now())
         if self.now.version != since:
             return self.now
-        if self.now.playing or self.now.buffering:
+        if (self.now.playing or self.now.buffering) and not self.now.stale:
             timeout = min(timeout, max(0.0, self.now.updated + STALE_S - now()) + 0.01)
         changed = self._changed
         try:
@@ -152,6 +159,7 @@ class Phone:
             "durationMs": s.duration_ms,
             "playing": s.playing,
             "active": s.playing or s.buffering,  # the player's music, sounding or about to: it comes first
+            "stale": s.stale,
             "positionMs": round(self.position(t)),
             "speed": s.speed,
             "songId": s.song_id,

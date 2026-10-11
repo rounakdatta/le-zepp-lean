@@ -39,11 +39,19 @@ def test_a_heartbeat_wakes_nobody_but_a_pause_a_seek_or_a_new_track_does():
     assert p.now.version == v + 3 and p.now.song_id is None
 
 
-def test_a_player_gone_quiet_is_not_trusted_to_be_playing():
+def test_a_helper_gone_quiet_is_marked_stale_and_its_music_taken_to_play_on():
+    """Android holds the helper back while the phone's screen is off: marked paused (as at
+    first), the lyrics froze while YouTube Music played on."""
     p = phone.Phone()
     p.update(update(), 100.0)
-    assert p.view(120.0)["playing"] is True
-    assert p.view(100.0 + phone.STALE_S + 1)["playing"] is False
+    v = p.view(120.0)
+    assert v["playing"] is True and v["stale"] is False
+    late = p.view(100.0 + phone.STALE_S + 5)
+    assert late["playing"] is True and late["stale"] is True and late["version"] == v["version"] + 1
+    assert late["positionMs"] == 10_000 + round((phone.STALE_S + 5) * 1000), "and its position runs on"
+    p.update(update(positionMs=60_000), 100.0 + phone.STALE_S + 10)
+    fresh = p.view(100.0 + phone.STALE_S + 10)
+    assert fresh["stale"] is False and fresh["version"] == late["version"] + 1, "it spoke: the watch hears so"
 
 
 def test_names_from_any_source_meet():
@@ -150,10 +158,9 @@ def test_a_lyrics_lookup_that_fails_is_retried_while_the_song_plays(api, monkeyp
     assert "none" not in seen, "the watch was never told there are no lyrics"
 
 
-def test_a_helper_gone_quiet_is_heard_of_at_once_as_paused_where_it_had_got_to(monkeypatch):
-    """Android killed the helper mid-song: after STALE_S it counts as paused, under a new
-    version, and a long poll waiting for news gets that then. (Only the view used to say so:
-    with no new version the relay passed nothing on, and the watch followed the old song for good.)"""
+def test_a_helper_gone_quiet_is_heard_of_at_once(monkeypatch):
+    """After STALE_S of silence it is marked stale under a new version, and a long poll waiting
+    for news gets that then (only the view used to say anything, and nothing passed it on)."""
     monkeypatch.setattr(phone, "STALE_S", 0.3)
     p = phone.Phone()
     p.update(update(), time.time())
@@ -165,6 +172,16 @@ def test_a_helper_gone_quiet_is_heard_of_at_once_as_paused_where_it_had_got_to(m
         return snap, time.perf_counter() - t
 
     snap, waited = asyncio.run(poll())
-    assert snap.version == v + 1 and not snap.playing
+    assert snap.version == v + 1 and snap.stale and snap.playing
     assert waited < 1.0, "woken as the helper went quiet, not at the end of the poll"
-    assert abs(snap.position_ms - 10_300) < 30, "paused where the track had got to by then"
+
+
+def test_what_the_helper_said_lately_can_be_looked_at(api):
+    client, app_module, _ = api
+    client.post("/phone", json={"app": SPOTIFY, "title": "Song", "artist": "Band", "state": "playing", "positionMs": 1000,
+                                "sentAt": time.time() * 1000})
+    client.post("/phone", json={"app": SPOTIFY, "title": "Song", "artist": "Band", "state": "paused", "positionMs": 2000,
+                                "sentAt": time.time() * 1000})
+    recent = client.get("/phone/recent").json()
+    assert [r["state"] for r in recent[:2]] == ["paused", "playing"]
+    assert recent[0]["title"] == "Song" and recent[0]["agoS"] >= 0
