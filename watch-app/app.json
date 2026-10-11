@@ -5,8 +5,8 @@
     "appName": "LeZeppLean",
     "appType": "app",
     "version": {
-      "code": 3,
-      "name": "0.2.9"
+      "code": 4,
+      "name": "0.3.0"
     },
     "icon": "icon.png",
     "vender": "le-zepp-lean",
