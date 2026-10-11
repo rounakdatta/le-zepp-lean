@@ -242,3 +242,26 @@ def test_silence_is_passed_on_even_while_shazam_refuses_calls(api, monkeypatch):
     r = client.post("/listen/audio", json={"session": "q3", "startedAt": time.time() * 1000, "offset": 0, "quiet": True}).json()
     assert r["reason"] == "quiet"
     assert client.get("/phone/next?since=-1&wait=0").json()["heard"]["quiet"] is True
+
+
+def test_an_idle_player_or_buffering_gone_quiet_is_no_music_and_the_phone_listens(api, monkeypatch):
+    """Spotify, idle, said "buffering" with no title at 0: the phone's mic was turned away."""
+    client, app_module, _ = api
+    asked = []
+
+    async def recognize(_wav, **_kw):
+        asked.append(1)
+        return match()
+
+    monkeypatch.setattr(app_module._recognizer, "recognize", recognize)
+    client.post("/phone", json={"app": "com.spotify.music", "title": "", "state": "buffering", "positionMs": 0,
+                                "sentAt": time.time() * 1000})
+    stream(client, 5, time.time() * 1000, session="idle")
+    assert settle(lambda: len(asked) == 1), "an idle player is no music: listened to"
+    p = app_module._phone
+    p.update({"app": "com.spotify.music", "title": "Song", "artist": "Band", "state": "buffering", "positionMs": 0}, time.time() - 100)
+    assert p.music_playing(time.time() - 99), "buffering a track: its music, a moment from sounding"
+    assert not p.music_playing(time.time()), "buffering with no word for 100 s: no music"
+    p.update({"app": "com.spotify.music", "title": "Song", "artist": "Band", "state": "playing", "positionMs": 0}, time.time())
+    assert p.music_playing(time.time() + 200), "playing, held back a few minutes: still taken to play"
+    assert not p.music_playing(time.time() + 400), "silent past the limit: not any more"

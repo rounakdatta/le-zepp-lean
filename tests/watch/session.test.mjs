@@ -1083,16 +1083,24 @@ test('a song from a phone gone quiet is let go at its end, and the room listened
   assert.ok(session.looking(s))
 })
 
-test('a phone gone quiet with no end to wait for (a live stream, a stalled one) is let go after a while', () => {
-  for (const v of [{ durationMs: null }, { playing: false, active: true }]) {
-    const s = session.createSession()
-    onPhone(s, 0, { version: 1, positionMs: 30_000, ...v })
-    onPhone(s, 40_000, { version: 2, positionMs: 70_000, stale: true, ageMs: 40_000, ...v })
-    session.onTick(s, 200_000)
-    assert.equal(s.source, 'phone', 'held back for a few minutes: still followed')
-    session.onTick(s, 301_000)
-    assert.equal(s.source, 'room', JSON.stringify(v))
-  }
+test('a phone gone quiet with no end to wait for (a live stream) is let go after a while', () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, positionMs: 30_000, durationMs: null })
+  onPhone(s, 40_000, { version: 2, positionMs: 70_000, stale: true, ageMs: 40_000, durationMs: null })
+  session.onTick(s, 200_000)
+  assert.equal(s.source, 'phone', 'held back for a few minutes: still followed')
+  session.onTick(s, 301_000)
+  assert.equal(s.source, 'room')
+})
+
+test('a phone stuck buffering with no word is let go like a paused one, after a minute', () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, positionMs: 30_000 })
+  onPhone(s, 40_000, { version: 2, playing: false, active: true, stale: true, positionMs: 32_000 })
+  session.onTick(s, 90_000)
+  assert.equal(s.source, 'phone')
+  session.onTick(s, 101_000)
+  assert.equal(s.source, 'room')
 })
 
 test('a phone gone quiet, once let go, is not taken up again by a later word that is still not from it', () => {
@@ -1107,4 +1115,31 @@ test('a phone gone quiet, once let go, is not taken up again by a later word tha
   assert.deepEqual(session.takeEvents(s).filter((e) => e.type === 'song'), [])
   onPhone(s, 70_000, { version: 4, title: 'Champagne Supernova', songId: 'champagne', positionMs: 1000 }) // it speaks again
   assert.equal(s.source, 'phone')
+})
+
+test('a phone buffering with no word for a while is no longer taken as its music: the mics look', () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  onPhone(s, 0, { version: 1, positionMs: 30_000 })
+  onPhone(s, 2000, { version: 2, playing: false, active: true, positionMs: 32_000 }) // buffering
+  assert.ok(session.phonePlaying(s))
+  onPhone(s, 40_000, { version: 3, playing: false, active: true, stale: true, positionMs: 32_000 }) // and nothing since
+  assert.ok(!session.phonePlaying(s), 'stuck buffering is no music')
+  assert.ok(session.looking(s), 'the mics look')
+})
+
+// ---- a wrong song length (2026-10-11: "Nobody" stored as 4 s long) ----
+
+test('a song found far past its known length is not ended by its own clock again and again', () => {
+  const s = session.createSession()
+  const [req] = feed(s, 0, 84, () => LOUD)
+  const res = found(108_000, { song: { id: 'nobody', title: 'Nobody', artist: 'Anna of the North', durationMs: 4000 } })
+  session.onResponse(s, req, res, 84 * MS + 1500)
+  assert.equal(s.song.durationMs, null, 'heard 108 s in: 4 s is not its length')
+  for (let t = 84 * MS + 1500; t < 30_000; t += 200) session.onTick(s, t)
+  assert.equal(s.song && s.song.id, 'nobody', 'still the song: no "Song ended"')
+  // nor does a later answer still carrying the wrong length bring it back
+  const poll = { id: 970, kind: 'lyrics', purpose: 'words', from: -1, to: -1, song: 'nobody', startAt: null }
+  session.onResponse(s, poll, { ok: true, song: { id: 'nobody', durationMs: 4000 }, lyrics: { version: 'v1', kind: 'synced', lines: LINES }, words: { status: 'unavailable' } }, 31_000)
+  assert.equal(s.song.durationMs, null)
 })

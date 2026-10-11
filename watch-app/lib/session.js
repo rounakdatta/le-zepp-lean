@@ -602,7 +602,8 @@ function followPlayer(s, view, now) {
   if (s.phone && view.version === s.phone.version && view.title === s.phone.title) return s.source === 'phone'
   const track = view.title ? view.title + '\u0000' + (view.artist || '') : ''
   const prev = s.phone
-  const active = view.active !== undefined ? !!view.active : !!view.playing // buffering is still its music
+  // buffering is still its music; buffering gone quiet (no word comes while buffering) is not
+  const active = (view.active !== undefined ? !!view.active : !!view.playing) && !(view.stale && !view.playing)
   const pausedSince = active ? null : prev && prev.track === track && prev.pausedSince !== null ? prev.pausedSince : now
   const spokeAt = typeof view.ageMs === 'number' ? now - view.ageMs : now
   s.phone = { version: view.version, title: view.title, track, playing: !!view.playing, active, pausedSince, stale: !!view.stale, spokeAt }
@@ -825,6 +826,7 @@ export function onResponse(s, req, res, now) {
       resumed = true
     }
     const r = clock.addMatch(s.clock, req.startAt, offset)
+    distrustLength(s, offset)
     if (r.kind === 'jump') {
       s.stats.seeks += 1
       activity.forgetTrack(s.act)
@@ -953,6 +955,7 @@ function startSong(s, res, req, now) {
   clock.reset(s.clock)
   clock.setRatePrior(s.clock, res.match.skew)
   clock.addMatch(s.clock, req.startAt, res.match.offsetMs)
+  distrustLength(s, res.match.offsetMs)
   activity.forgetTrack(s.act)
   activity.markPlaying(s.act)
   s.resumeCheck = null
@@ -971,10 +974,20 @@ function startSong(s, res, req, now) {
 }
 
 // Lyrics, word status and the loudness track, each only when the server sent a new version.
+// A song heard at a place past its known length: the length is wrong (a bad catalog entry gave
+// "Nobody" 4 s, and the watch ended it every time it was found). No length beats a wrong one.
+function distrustLength(s, positionMs) {
+  if (s.song && s.song.durationMs && positionMs > s.song.durationMs) s.song.durationMs = null
+}
+
 function mergeSongData(s, res, now) {
   const song = s.song
-  // its length, if it wasn't known when the song started (a song the phone's mic named first)
-  if (res.song && res.song.durationMs && !song.durationMs) song.durationMs = res.song.durationMs
+  // its length as the server has it (a room song's: the phone's player knows its own), unless
+  // the song is already past it
+  if (res.song && res.song.durationMs !== undefined && s.source !== 'phone') {
+    const d = res.song.durationMs || null
+    if (!d || !clock.isKnown(s.clock) || d > clock.songAt(s.clock, now)) song.durationMs = d
+  }
   if (res.lyrics && res.lyrics.version !== song.lyricsVersion) {
     song.kind = res.lyrics.kind || 'none'
     song.lines = normalizeLines(res.lyrics.lines || [])

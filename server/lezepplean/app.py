@@ -275,6 +275,32 @@ async def _lookup_lyrics(song: Song, length_ok: bool = True, retry_length: bool 
         # Apple didn't answer: LRCLIB's length, for now. Without any length the watch can't
         # tell when the song ends, and a gapless next song took 30-50 s to be noticed.
         song.duration_ms = round(lyrics.duration_s * 1000)
+    _check_length(song)
+
+
+MIN_SONG_MS = 30_000
+
+
+def _check_length(song: Song, heard_at_ms: float | None = None) -> bool:
+    """A song's length must be one it can have: past its lyrics' last line, past where it was
+    just heard, and a song's, not a jingle's. A bad catalog entry gave "Nobody" 4 s: the watch
+    ended it every time it was found, and no copy of that length was found to time its words.
+    A wrong one gives way to LRCLIB's, if that one can be right, else to none (no length beats
+    a wrong one), and the song's audio is looked for again. True when it was wrong."""
+    if not song.duration_ms:
+        return False
+    last = max((ms for ms, text in (song.lrc or []) if text), default=0)
+    floor = max(MIN_SONG_MS, last + 1000, (heard_at_ms or 0) + 1000)
+    if song.duration_ms >= floor:
+        return False
+    other = (song.lyrics_source or {}).get("durationS")
+    log.warning("%s: %d ms can't be its length (lyrics to %d ms, heard at %s ms)", song.id, song.duration_ms, last, heard_at_ms)
+    song.duration_ms = round(other * 1000) if other and other * 1000 >= floor else None
+    song.length_checked = True  # don't ask Apple again: it gave this one
+    song.notes.append(f"a length the song outlasts was dropped (lyrics to {last} ms)")
+    if song.reference_status == "unavailable":
+        song.reference_retry_at = 0.0  # looked for with that length: look again
+    return True
 
 
 _romanizing: set[str] = set()
@@ -384,7 +410,7 @@ async def _first_lyrics(song: Song, position_ms: float | None) -> None:
         if duration_s:
             song.duration_ms = round(duration_s * 1000)
             song.length_checked = True
-        await _lookup_lyrics(song, length_ok)
+        await _lookup_lyrics(song, length_ok)  # (which checks the length against the lyrics)
     except Exception:
         log.exception("lyrics for %s failed", song.id)
         song.lyrics_kind = "none"
@@ -511,7 +537,7 @@ async def listen_audio(req: ListenChunk, authorization: str | None = Header(None
     t = time.time()
     rec = _listening.get(req.session[:64], (req.startedAt + _phone.clock(req.sentAt, t)) / 1000, t)
     _phone.expire(t)
-    if not rec.done and (_phone.now.playing or _phone.now.buffering):
+    if not rec.done and _phone.music_playing(t):
         rec.finish("phone_playing")  # the phone's own player comes first: it is followed, not heard
     if not rec.done and req.quiet and t - rec.start_at <= listen.MAX_AGE_S:
         rec.finish("quiet")  # needs no Shazam call: passed on even while Shazam refuses
@@ -559,6 +585,8 @@ async def _hear(rec: listen.Listening) -> None:
         return
     rec.finish("found")
     song = await _song_for(found, found.offset_ms + (time.time() - rec.start_at) * 1000 + 3000, wait_s=0)
+    if _check_length(song, found.offset_ms):
+        _store.put(song)
     t = time.time()
     _phone.hear({"id": rec.id, "songId": song.id, "title": song.title, "artist": song.artist,
                  "durationMs": song.duration_ms, "positionMs": found.offset_ms + (t - rec.start_at) * 1000}, t)
@@ -702,6 +730,8 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
                 return response
             # where the song will be when the answer reaches the watch (see ensure below)
             song = await _song_for(found, found.offset_ms + (clip.duration_ms or 0) + 3000)
+            if _check_length(song, found.offset_ms):
+                _store.put(song)
             match = {"offsetMs": round(found.offset_ms, 1), "skew": found.timeskew, "method": "shazam"}
             t = lap("lyricsMs", t)
 
