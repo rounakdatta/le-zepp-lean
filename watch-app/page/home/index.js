@@ -203,7 +203,7 @@ function onPhoneView(pv, trip) {
   const late = trip !== null ? trip / 2 : bleOneWayMs
   const v = Object.assign({}, pv)
   if (pv.playing) v.positionMs = pv.positionMs + late * (pv.speed || 1)
-  if (pv.heard) v.heard = Object.assign({}, pv.heard, { positionMs: pv.heard.positionMs + late })
+  if (pv.heard && typeof pv.heard.positionMs === 'number') v.heard = Object.assign({}, pv.heard, { positionMs: pv.heard.positionMs + late })
   session.onPhone(s, v, now)
   handleEvents()
   refresh()

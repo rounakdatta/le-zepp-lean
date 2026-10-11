@@ -541,10 +541,28 @@ export function onPhone(s, view, now) {
 // `now`) }. Taken while the watch is looking (no song, or only the phone's, paused): the
 // watch's own search, if it gets there too, then only refines where the song is.
 function onHeard(s, h, now) {
-  if (!h.id || !h.songId || h.id === s.heardId) return
+  if (!h.id || h.id === s.heardId) return
   s.heardId = h.id
+  if (phonePlaying(s)) return // the phone's player comes first, always
+  if (h.quiet) {
+    // The phone, whose mic named the song, hears nothing now: the music stopped (the watch's
+    // mic couldn't tell). Its next listen that hears the song carries it on.
+    if (s.heardOnly && isPlaying(s)) {
+      clock.pause(s.clock, now)
+      s.stats.pauses += 1
+      emit(s, 'pause', { at: now, source: 'heard' })
+    }
+    return
+  }
+  if (!h.songId) return
   if (s.heardOnly && s.song && s.song.id === h.songId) {
-    clock.addMatch(s.clock, now, h.positionMs) // the phone's ears again: where the song is now
+    // the phone's ears again: where the song is now (and playing again, if it had stopped)
+    if (clock.isPaused(s.clock)) {
+      clock.resume(s.clock, now)
+      s.stats.resumes += 1
+      emit(s, 'resume', { at: now, source: 'heard' })
+    }
+    clock.addMatch(s.clock, now, h.positionMs)
     return
   }
   if (!looking(s) && !s.heardOnly) return
@@ -573,6 +591,7 @@ function followPlayer(s, view, now) {
   if (s.source !== 'phone' || !s.song || s.phoneTrack !== track) {
     s.source = 'phone'
     s.phoneTrack = track
+    s.heardOnly = false
     s.inflight = null // whatever the mic asked about is moot now
     s.song = {
       id: view.songId || null,
@@ -868,8 +887,9 @@ function onMiss(s, req, res, now) {
   }
   // A periodic check failed. Keep the lyrics running; two in a row and look for a new song.
   // Unless the server couldn't say (Shazam refusing calls, a timeout): that says nothing about
-  // the song, and three such in a row used to end it.
-  if (res.reason !== 'no_match' && res.reason !== 'bad_audio') {
+  // the song, and three such in a row used to end it. Nor can the watch's own mic say, for a
+  // song only the phone's mic has heard (a gym too loud to place the watch's audio in).
+  if (s.heardOnly || (res.reason !== 'no_match' && res.reason !== 'bad_audio')) {
     s.nextVerifyAt = now + 15000
     return
   }

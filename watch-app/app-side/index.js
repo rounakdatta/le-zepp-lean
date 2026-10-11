@@ -107,7 +107,7 @@ function phoneNow() {
   if (!v) return { version: -1, title: '' }
   const since = Date.now() - phone.at + SERVER_TO_PHONE_MS
   const out = Object.assign({}, v, { positionMs: Math.round(v.positionMs + (v.playing ? since * (v.speed || 1) : 0)), sentAt: Date.now() })
-  if (v.heard) out.heard = Object.assign({}, v.heard, { positionMs: Math.round(v.heard.positionMs + since) })
+  if (v.heard && typeof v.heard.positionMs === 'number') out.heard = Object.assign({}, v.heard, { positionMs: Math.round(v.heard.positionMs + since) })
   return out
 }
 

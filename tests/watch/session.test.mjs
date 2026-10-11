@@ -1001,3 +1001,40 @@ test('a search made while the phone is paused is about whatever plays, not the s
   assert.equal(find.song, null)
   assert.equal(find.known, null, "else the server left out lyrics it thought the watch had")
 })
+
+// ---- the follow-up review (2026-10-11) ----
+
+test("a song only the phone's mic heard stops when the phone hears nothing, and carries on when it hears it again", () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard() }, 10_000)
+  session.onPhone(s, { version: 4, title: '', playing: false, heard: { id: 'r2', quiet: true } }, 40_000)
+  assert.ok(clock.isPaused(s.clock), 'the music stopped: the phone that named it hears nothing')
+  const frozen = session.position(s, 40_000)
+  assert.equal(Math.round(session.position(s, 60_000)), Math.round(frozen))
+  session.onPhone(s, { version: 5, title: '', playing: false, heard: heard({ id: 'r3', positionMs: 74_000 }) }, 70_000)
+  assert.ok(!clock.isPaused(s.clock), 'heard again: on it goes')
+  assert.equal(Math.round(session.position(s, 70_000)), 74_000, 'from where the phone heard it')
+})
+
+test("the phone's player taking over is never undone by a late word from its mic", () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard() }, 10_000) // a song only the phone heard
+  onPhone(s, 20_000, { version: 4, title: 'Champagne Supernova', songId: 'champagne', positionMs: 30_000 }) // then it plays
+  session.onPhone(s, { version: 5, title: 'Champagne Supernova', artist: 'Oasis', durationMs: 258_000, playing: true, active: true,
+    positionMs: 31_000, speed: 1, songId: 'champagne', heard: heard({ id: 'r9', songId: 'other', title: 'Other' }) }, 21_000)
+  assert.equal(s.song.title, 'Champagne Supernova')
+  assert.ok(session.phonePlaying(s))
+  assert.equal(session.wantsPhoneEars(s), false)
+})
+
+test("in a room too loud for the watch to place its audio, its misses don't end a song the phone vouches for", () => {
+  const s = session.createSession()
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard() }, 10_000)
+  for (let k = 0; k < 5; k++) {
+    const req = { id: 960 + k, kind: 'identify', purpose: 'sync', song: 'wonderwall', startAt: 20_000 + k * 1000, from: 0, to: 49 }
+    session.onResponse(s, req, { ok: false, reason: 'no_match' }, 21_000 + k * 1000)
+  }
+  assert.equal(s.song && s.song.id, 'wonderwall')
+})

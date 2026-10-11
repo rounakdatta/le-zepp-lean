@@ -57,6 +57,16 @@ class Phone:
             self._lags.append(received * 1000 - sent_ms)
         return min(self._lags) if self._lags else 0.0
 
+    def _heard_view(self, t: float) -> dict | None:
+        """What the phone's mic named, fresh, with the song where it is at `t` (a report that it
+        hears nothing has no song, nor position)."""
+        if not self.heard or t - self.heard_at >= HEARD_FRESH_S:
+            return None
+        h = dict(self.heard)
+        if "positionMs" in h:
+            h["positionMs"] = round(h["positionMs"] + (t - self.heard_at) * 1000)
+        return h
+
     def hear(self, heard: dict, t: float) -> None:
         """The phone's mic named a song (listen.py): the watch hears of it like any change.
         `heard` holds where the song was at `t`."""
@@ -146,8 +156,7 @@ class Phone:
             "speed": s.speed,
             "songId": s.song_id,
             "ageMs": round((t - s.updated) * 1000) if s.updated else None,
-            "heard": ({**self.heard, "positionMs": round(self.heard["positionMs"] + (t - self.heard_at) * 1000)}
-                      if self.heard and t - self.heard_at < HEARD_FRESH_S else None),
+            "heard": self._heard_view(t),
         }
 
 

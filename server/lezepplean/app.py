@@ -170,8 +170,9 @@ class ListenChunk(BaseModel):
     startedAt: float          # the phone's clock (ms since 1970) at the recording's first sample
     offset: int               # this piece's first sample, counted from the recording's first
     rate: int = listen.RATE
-    pcm: str                  # base64, 16-bit little-endian mono
+    pcm: str = ""             # base64, 16-bit little-endian mono
     sentAt: float | None = None  # the phone's clock when this was sent
+    quiet: bool = False       # the phone hears nothing (its first second was silent): no audio comes
 
 
 class LyricsRequest(BaseModel):
@@ -516,6 +517,9 @@ async def listen_audio(req: ListenChunk, authorization: str | None = Header(None
         rec.finish("busy")  # Shazam is refusing calls: no point sending more
     if not rec.done and t - rec.start_at > listen.MAX_AGE_S:
         rec.finish("stale")  # held up somewhere: too old to name as what plays now
+    if not rec.done and req.quiet:
+        rec.finish("quiet")
+        _phone.hear({"id": rec.id, "quiet": True}, t)  # a song only the phone heard has stopped
     if not rec.done:
         rec.put(req.offset, base64.b64decode(req.pcm))
         if rec.due():
@@ -532,6 +536,9 @@ async def _hear(rec: listen.Listening) -> None:
         level = _level_dbfs(pcm)["rmsDb"]
         if level is not None and level < listen.QUIET_DB:
             log.info("listening %s: quiet (%.0f dBFS), Shazam not asked", rec.id, level)
+            if rec.asked == 0:  # silence from the start: say so (it stops a song only the phone heard)
+                rec.finish("quiet")
+                _phone.hear({"id": rec.id, "quiet": True}, time.time())
         else:
             found = await asyncio.wait_for(_recognizer.recognize(zepp_opus.pcm_to_wav(pcm), wait=True), RECOGNIZE_TIMEOUT_S)
     except RecognizerBusy:

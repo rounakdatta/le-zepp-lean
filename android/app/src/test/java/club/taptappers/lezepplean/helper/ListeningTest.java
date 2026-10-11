@@ -15,7 +15,7 @@ import org.junit.Test;
 
 public class ListeningTest {
     private static Listening.Request read(String raw) throws IOException {
-        return Listening.read(new ByteArrayInputStream(raw.getBytes(StandardCharsets.US_ASCII)));
+        return Listening.read(new ByteArrayInputStream(raw.getBytes(StandardCharsets.US_ASCII)), System.nanoTime() + 2_000_000_000L);
     }
 
     // HMAC-SHA256("abc", "lezepplean-listen:1700000000000"), from Node's crypto: what the side service sends
@@ -52,6 +52,19 @@ public class ListeningTest {
         for (int i = 0; i < 5000; i++) b.append('y');
         assertNull(read(b.toString()));
         assertNull("not HTTP", read(""));
+    }
+
+    @Test
+    public void aClientTooSlowToFinishItsRequestIsNotWaitedFor() throws IOException {
+        byte[] whole = ("POST /listen HTTP/1.1\r\nauthorization: " + SIGNED + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
+        assertNull(Listening.read(new ByteArrayInputStream(whole), System.nanoTime() - 1));
+    }
+
+    @Test
+    public void silenceIsReportedWithoutAnyAudio() {
+        String body = Listening.quiet("p1", 1234L, 5678L);
+        assertTrue(body.contains("\"quiet\":true"));
+        assertFalse(body.contains("pcm"));
     }
 
     @Test

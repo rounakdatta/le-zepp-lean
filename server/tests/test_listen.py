@@ -172,6 +172,7 @@ def test_a_piece_claiming_a_far_offset_never_grows_the_recording():
     assert len(r.pcm) == 0
     r.put(0, b"\x01\x00" * 10 + b"\x07")  # an odd byte: never half a sample
     assert len(r.pcm) == 20
+    r.put(10, b"\x00\x00" * (listen.LIMIT // 2 - 14))  # a long recording, up to near its limit
     r.put(listen.LIMIT // 2 - 4, b"\x02\x00" * 100)  # runs past the limit: cut at it
     assert len(r.pcm) == listen.LIMIT
 
@@ -215,3 +216,21 @@ def test_a_phone_buffering_is_still_the_phones_music(api, monkeypatch):
     replies = stream(client, 6, time.time() * 1000)
     assert replies[0]["done"] and replies[0]["reason"] == "phone_playing"
     assert asked == []
+
+
+def test_the_phone_hearing_nothing_is_passed_on_with_no_audio_sent(api):
+    client, app_module, _ = api
+    r = client.post("/listen/audio", json={"session": "q2", "startedAt": time.time() * 1000, "offset": 0, "quiet": True}).json()
+    assert r["done"] and r["reason"] == "quiet"
+    heard = client.get("/phone/next?since=-1&wait=0").json()["heard"]
+    assert heard["id"] == "q2" and heard["quiet"] is True
+
+
+def test_no_more_than_a_few_recordings_are_held_whatever_a_client_sends():
+    recs = listen.Recordings()
+    for i in range(50):
+        recs.get(f"r{i}", 0.0, float(i)).put(0, b"\x01\x00")
+    assert len(recs._all) == listen.MAX_RECORDINGS
+    r = listen.Listening("g", 0.0)
+    r.put(10 * HALF_S, b"\x01\x00" * 4)  # 5 s past the end: not a lost piece, nothing held for it
+    assert len(r.pcm) == 0

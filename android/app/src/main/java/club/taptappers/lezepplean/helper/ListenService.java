@@ -28,6 +28,10 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -50,6 +54,8 @@ public class ListenService extends Service {
     static volatile String status = "Off";
 
     private final ExecutorService uploads = Executors.newSingleThreadExecutor();
+    // two requests read at a time, each within 2 s: a client that dawdles can't hold the trigger
+    private final ThreadPoolExecutor triggers = new ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS, new SynchronousQueue<>());
     private final AtomicBoolean recording = new AtomicBoolean();
     private final AtomicBoolean serving = new AtomicBoolean();
     private volatile ServerSocket server;
@@ -94,6 +100,7 @@ public class ListenService extends Service {
         }
         server = null;
         uploads.shutdownNow();
+        triggers.shutdownNow();
         super.onDestroy();
     }
 
@@ -114,18 +121,11 @@ public class ListenService extends Service {
             server = s;
             status = "Ready: the watch can ask this phone to listen";
             while (!s.isClosed()) {
-                try (Socket c = s.accept()) {
-                    c.setSoTimeout(2000);
-                    Listening.Request r = Listening.read(c.getInputStream());
-                    long t = r == null || !"/listen".equals(r.path) ? -1
-                            : Listening.verify(r.authorization, Reporter.get(this).token(), System.currentTimeMillis(), lastTrigger);
-                    c.getOutputStream().write(Listening.reply(r == null ? 400 : !"/listen".equals(r.path) ? 404 : t > 0 ? 202 : 403));
-                    if (t > 0) {
-                        lastTrigger = t;
-                        listen();
-                    }
-                } catch (Exception e) {
-                    // one bad request: carry on
+                Socket c = s.accept();
+                try {
+                    triggers.execute(() -> answer(c));
+                } catch (RejectedExecutionException e) {
+                    close(c); // both busy with slow clients: this one waits for nothing
                 }
             }
         } catch (Exception e) {
@@ -134,6 +134,33 @@ public class ListenService extends Service {
         } finally {
             server = null;
             serving.set(false);
+        }
+    }
+
+    private void answer(Socket c) {
+        try {
+            c.setSoTimeout(2000);
+            Listening.Request r = Listening.read(c.getInputStream(), System.nanoTime() + 2_000_000_000L);
+            long t;
+            synchronized (this) {
+                t = r == null || !"/listen".equals(r.path) ? -1
+                        : Listening.verify(r.authorization, Reporter.get(this).token(), System.currentTimeMillis(), lastTrigger);
+                if (t > 0) lastTrigger = t;
+            }
+            c.getOutputStream().write(Listening.reply(r == null ? 400 : !"/listen".equals(r.path) ? 404 : t > 0 ? 202 : 403));
+            if (t > 0) listen();
+        } catch (Exception e) {
+            // one bad request: carry on
+        } finally {
+            close(c);
+        }
+    }
+
+    private static void close(Socket c) {
+        try {
+            c.close();
+        } catch (Exception e) {
+            // gone already
         }
     }
 
@@ -199,7 +226,13 @@ public class ListenService extends Service {
                     offset += n;
                     continue;
                 }
-                if (!heard) break; // a second of silence: nothing to name, nothing sent
+                if (!heard) {
+                    // a second of silence: no audio sent, only that it heard nothing (that stops a
+                    // song only this phone's mic had heard, whose music has stopped)
+                    final long t0 = startedAt;
+                    uploads.execute(() -> post(Listening.quiet(session, t0, System.currentTimeMillis())));
+                    break;
+                }
                 int at = offset - first.size() * Listening.PIECE;
                 for (byte[] held : first) send(done, session, startedAt, at, held, readAt);
                 at += first.size() * Listening.PIECE;
@@ -250,6 +283,11 @@ public class ListenService extends Service {
 
     /** One piece to the server; true once it says it has what it needs. A failed piece is tried once more. */
     private boolean upload(String session, long startedAt, int offset, byte[] pcm) {
+        return post(Listening.piece(session, startedAt, offset, pcm, System.currentTimeMillis()));
+    }
+
+    /** A body to POST /listen/audio; true once the server says it has what it needs. Tried twice. */
+    private boolean post(String json) {
         for (int attempt = 0; attempt < 2; attempt++) {
             HttpURLConnection h = null;
             try {
@@ -261,7 +299,7 @@ public class ListenService extends Service {
                 h.setDoOutput(true);
                 h.setRequestProperty("Content-Type", "application/json");
                 h.setRequestProperty("Authorization", "Bearer " + r.token());
-                byte[] body = Listening.piece(session, startedAt, offset, pcm, System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8);
+                byte[] body = json.getBytes(StandardCharsets.UTF_8);
                 try (OutputStream out = h.getOutputStream()) {
                     out.write(body);
                 }

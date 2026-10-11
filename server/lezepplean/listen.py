@@ -21,6 +21,8 @@ MAX_S = 8.0                 # the helper stops listening after this much
 KEEP_S = 60.0               # a recording nothing has been added to for this long is forgotten
 MAX_AGE_S = MAX_S + 20      # audio that began longer ago than this is too old to name as playing now
 LIMIT = int((MAX_S + 2) * RATE) * 2  # bytes: no recording grows past this, whatever a piece claims
+MAX_GAP = 2 * RATE * 2                # bytes: a piece further than 2 s past the end isn't a lost one
+MAX_RECORDINGS = 8                    # held at once (one phone): a ninth pushes out the stalest
 QUIET_DB = -55.0            # quieter than this (RMS, dBFS) is no music to name: no Shazam call spent on it
 
 
@@ -43,7 +45,7 @@ class Listening:
         """16-bit samples from `offset` (counted from the recording's first) on. Nothing past
         LIMIT: a piece claiming a far offset used to zero-fill the buffer up to it."""
         a = offset * 2
-        if offset < 0 or a >= LIMIT:
+        if offset < 0 or a >= LIMIT or a > len(self.pcm) + MAX_GAP:
             return
         data = data[: min(len(data), LIMIT - a) // 2 * 2]  # whole samples only
         if a > len(self.pcm):
@@ -67,6 +69,8 @@ class Recordings:
             del self._all[k]
         r = self._all.get(rid)
         if r is None:
+            if len(self._all) >= MAX_RECORDINGS:
+                del self._all[min(self._all.values(), key=lambda v: v.updated).id]
             r = self._all[rid] = Listening(rid, start_at)
         r.updated = now
         return r

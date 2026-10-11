@@ -37,13 +37,16 @@ final class Listening {
         }
     }
 
-    /** Reads an HTTP request's head, at most HEAD_LIMIT bytes (and skips its small body). Null if it isn't one. */
-    static Request read(InputStream raw) throws IOException {
+    /**
+     * Reads an HTTP request's head, at most HEAD_LIMIT bytes and until `deadlineNanos` (a client
+     * trickling a byte at a time can't hold it), and skips its small body. Null if it isn't one.
+     */
+    static Request read(InputStream raw, long deadlineNanos) throws IOException {
         InputStream in = new BufferedInputStream(raw, 512);
         byte[] head = new byte[HEAD_LIMIT];
         int n = 0;
         boolean ended = false;
-        while (n < head.length) {
+        while (n < head.length && System.nanoTime() < deadlineNanos) {
             int b = in.read();
             if (b < 0) break;
             head[n++] = (byte) b;
@@ -72,7 +75,7 @@ final class Listening {
                 }
             }
         }
-        for (int i = 0; i < length && in.read() >= 0; i++) {
+        for (int i = 0; i < length && System.nanoTime() < deadlineNanos && in.read() >= 0; i++) {
             // the body ({}) says nothing: read so the sender isn't cut off mid-write
         }
         return new Request(parts[0], parts[1], auth);
@@ -149,6 +152,12 @@ final class Listening {
     static String piece(String session, long startedAt, int offset, byte[] pcm, long sentAt) {
         return "{\"session\":\"" + session + "\",\"startedAt\":" + startedAt + ",\"offset\":" + offset
                 + ",\"rate\":" + RATE + ",\"pcm\":\"" + Base64.getEncoder().encodeToString(pcm) + "\",\"sentAt\":" + sentAt + "}";
+    }
+
+    /** The body saying the phone hears nothing (its first second was silent): no audio is sent. */
+    static String quiet(String session, long startedAt, long sentAt) {
+        return "{\"session\":\"" + session + "\",\"startedAt\":" + startedAt + ",\"offset\":0,\"rate\":" + RATE
+                + ",\"quiet\":true,\"sentAt\":" + sentAt + "}";
     }
 
     private static final Pattern DONE = Pattern.compile("\"done\"\\s*:\\s*true");
