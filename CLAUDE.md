@@ -1,6 +1,6 @@
 # CLAUDE.md: LeZeppLean
 
-LeZeppLean is an Amazfit T-Rex 3 (Zepp OS) app. It listens to music playing nearby, identifies the song and shows the lyrics in time with it, **word by word**. When the music stops, the lyrics stop on the word it stopped on; when it comes back, they carry on from there. Skips and the next song are followed.
+LeZeppLean is an Amazfit T-Rex 3 (Zepp OS) app. It listens to music playing nearby, identifies the song and shows the lyrics in time with it, **word by word**. When the music stops, the lyrics stop on the word it stopped on; when it comes back, they carry on from there. Skips and the next song are followed. With earphones in, the mic hears nothing, so the watch follows the phone's player instead, through a small Android helper (`android/`). Lyrics in a script the user doesn't read, or that the watch can't draw, are shown in English letters.
 
 The user's bar is **sub-second latency for everything interactive**. Identifying a song inherently needs ~3–5 s of audio; everything else (pause and resume reactions, word highlights, re-sync corrections) must feel instant. Production will run on a **homelab: CPU-only Linux, keep it lean**. No GPU, no PyTorch in the serving path.
 
@@ -11,8 +11,9 @@ Platform research, with sources, is in `docs/research/` (start at `docs/research
 | Path | What |
 |---|---|
 | `watch-app/` | The Zepp OS app: watch page, `app-side/` (relay inside the Zepp phone app), `setting/` (settings screen in the Zepp app) |
-| `watch-app/lib/` | `live.js` (one continuous recording, read while it's written), `stream.js` (packet framing), `silk.js` (loudness from packet bytes), `activity.js` (playing / stopped), `envelope.js` (the song's own loudness track), `clock.js` (song clock: matches, pauses, playback speed), `session.js` (all the decisions: what to send, what changed; pure), `sync.js` (line and word at a position), `layout.js` (word-by-word layout), `view.js` (screen), `recorder.js` (5 s takes, the fallback), `prefs.js` |
-| `server/lezepplean/` | `app.py` (API), `recognize.py` (ShazamIO), `lyrics.py` (LRCLIB), `songs.py` (per-song store on disk), `prepare.py` (what gets computed, in what order), `worker.py` (the CPU steps, in a separate low-priority process), `reference.py` (the song's own audio from YouTube, mapped onto Shazam's timeline), `track.py` (fast re-sync), `silk.py` (loudness reader + the song's loudness track), `audio.py`, `zepp_opus.py` |
+| `watch-app/lib/` | `recorder.js` (back-to-back takes, what the T-Rex 3 runs on, and the one shared recorder), `live.js` (one continuous recording read while it's written, for firmware that allows it; the T-Rex 3 doesn't), `stream.js` (packet framing), `silk.js` (loudness from packet bytes), `activity.js` (playing / stopped), `envelope.js` (the song's own loudness track), `clock.js` (song clock: matches, pauses, playback speed), `session.js` (all the decisions: what to send, what changed, earphones mode; pure), `sync.js` (line and word at a position), `layout.js` (word-by-word layout), `view.js` (screen), `prefs.js` |
+| `server/lezepplean/` | `app.py` (API), `recognize.py` (ShazamIO), `lyrics.py` (LRCLIB), `songs.py` (per-song store on disk), `prepare.py` (what gets computed, in what order), `worker.py` (the CPU steps, in a separate low-priority process), `reference.py` (the song's own audio from YouTube, mapped onto Shazam's timeline), `track.py` (fast re-sync), `silk.py` (loudness reader + the song's loudness track), `phone.py` (the phone player's clock, for earphones mode), `roman.py` (lyrics in English letters, through auth2api), `visual.py` (native script reordered for a font that can't shape it), `audio.py`, `zepp_opus.py` |
+| `android/` | The helper for earphones mode: reads the playing media session (Android shows it only to apps with notification access) and posts it to `/phone`. `.github/workflows/android.yml` builds it; a `helper-v*` tag publishes the signed APK as a GitHub release |
 | `server/lezepplean/align/` | Word timing: `text.py` (lyrics → letters), `separate.py` (Spleeter vocals, ONNX), `ctc.py` (wav2vec 2.0 letter probabilities, ONNX int8), `forced.py` (banded CTC forced alignment), `__init__.py` (`align_lyrics`, measured settings) |
 | `server/scripts/` | `fake_watch.py` (send a clip like the phone does), `eval_align.py` / `eval_track.py` (benchmarks), `watch_sim.py` + `sim_stream.py` (what the watch would record), `silk_levels.py` |
 | `tests/watch/` | Node tests for the watch's pure logic |
@@ -29,7 +30,9 @@ Keep `watch-app/` self-contained. `zeus build` compiles every `.js` file in it, 
 
 The server runs on the homelab: **https://lezepplean.taptappers.club** (DNS in `oh-my-dns`, `A lezepplean`), deployed by `homelab.setup/kubernetes/apps/lezepplean` from the image `ghcr.io/rounakdatta/le-zepp-lean` and the chart `oci://ghcr.io/rounakdatta/charts/lezepplean`. The bearer token is the Bitwarden item `lezepplean/token` (and `pass api-keys/lezepplean/token`); `tools/install-watch.sh` builds the watch app against it unless a local tunnel is running.
 
-Releasing: bump `charts/lezepplean/Chart.yaml` `version` + `appVersion` and `values.yaml` `image.tag` together, merge to `main`, push an annotated tag `vX.Y.Z` (CI: tests, then image + chart at that version; the image reports the tag on `/health`), then bump `homelab.setup` (kustomization `version`, values `image.tag`, re-render the vendored chart, `charts.lock`) and deploy that branch with `deploy-stuff.yml` before merging it. The pod is pinned to the control plane, takes no CPU request (the node's requests are full; its usage isn't), and its `/data` volume is left out of Velero's nightly backup: everything on it can be rebuilt.
+Releasing: bump `charts/lezepplean/Chart.yaml` `version` + `appVersion` and `values.yaml` `image.tag` together, merge to `main`, push an annotated tag `vX.Y.Z` (CI: tests, then image + chart at that version; the image reports the tag on `/health`), then bump `homelab.setup` (kustomization `version`, values `image.tag`, re-render the vendored chart, `charts.lock`) and deploy that branch with `deploy-stuff.yml` before merging it. The pod is pinned to the control plane, takes no CPU request (the node's requests are full; its usage isn't), and its `/data` volume is left out of Velero's nightly backup: everything on it can be rebuilt. Lyrics in English letters need `LEZEPPLEAN_LLM_KEY`: on the homelab, the `auth2api-credentials` secret through the chart's `extraEnv`.
+
+The helper: bump `versionCode` and `versionName` in `android/app/build.gradle`, merge, push a tag `helper-vX.Y.Z`. CI signs every build with the same key (repo secrets `ANDROID_KEYSTORE_B64` and `ANDROID_KEYSTORE_PASSWORD`; a copy is in pass, `api-keys/lezepplean/android-keystore`), so a new APK installs over the old one and keeps its settings.
 
 ## Commands
 
@@ -63,18 +66,26 @@ On a nix-based Linux box, the PyAV, onnxruntime and numpy wheels need libstdc++ 
 ## How v0.2 works
 
 ```
-watch: mic ─► one continuous recording, read every 100 ms (live.js)
+watch: mic ─► back-to-back takes, 250 ms apart (recorder.js): 5 s while finding the song,
+             3 s when the take will be sent, 2 s while following; each is read when it stops
              └─ every 60 ms packet: loudness from the SILK gain index (silk.js)
                   ├─ activity.js: stopped? back? (+ the song's loudness track: quiet passage or pause?)
                   ├─ clock.js: pause/resume the song clock *on the packet it happened*
-                  └─ session.js: is the room still the song? when to ask the server, and what
-       short windows (5 s find, 3 s re-sync, 2 s after a resume) ─BLE─► phone ─► server
+                  └─ session.js: is the room still the song? (a resume is matched against the
+                     loudness track on the watch first) when to ask the server, and what
+       the takes worth sending (5 s to find, 2–3 s to place) ─BLE─► phone ─► server
 server: known song + its audio on disk?  track.py: place the window near the clock's guess (~30 ms)
-        otherwise:                       Shazam (~0.5 s) → song + LRCLIB lyrics → start preparing
+        otherwise:                       Shazam (~0.5 s) → song now, LRCLIB lyrics within 1.5 s
+                                         or "pending" (the watch polls) → start preparing
+        a script the user doesn't read:  English letters, once per song (roman.py, ~3–4 s)
         preparing (prepare.py → worker.py, once per song, kept on disk):
           YouTube audio → Shazam-checked + mapped → loudness track + re-sync features
           → Spleeter vocals → wav2vec 2.0 letters → forced alignment → word timings
-          (the next 30 s first, then the next 45 s, then the whole song)
+          (the next 30 s first, then the next 45 s, then the whole song; in English letters
+          for a song shown in them)
+earphones: helper (android/) ─ the player's state, on every change (+ every 10 s while playing) ─► POST /phone
+           side service ◄─ GET /phone/next (long poll, 8 s) ─ pushes each change to the watch,
+           whose song clock follows the player's with the mic off
 watch: lines [start, text, wordStarts|null, end|null]; the current line is one widget per
        word, lit as sung; timers fire at the exact next word or line change
 ```
@@ -87,15 +98,18 @@ watch: lines [start, text, wordStarts|null, end|null]; the current line is one w
 - The user's watch, measured 2026-10-10: **firmware 6.4.16.3, `getSystemInfo().minAPI` = "5.0"**.
 - Round 480×480 screen. Keys: UP and DOWN on the left, SELECT and BACK on the right. No crown.
 - It has a mic but no speaker (buzzer and vibration only). Wi-Fi exists but apps can't use it.
+- `hmSensor` is undefined for apps, so there is no music sensor: the watch can't see what the phone plays (hence the helper).
+- The system font has Devanagari, Bengali, Tamil, Malayalam, Kannada and Arabic glyphs but **no shaping**: vowel signs land on the wrong side of their consonant and conjuncts fall apart (`visual.py` reorders the letters to compensate). Telugu, Gurmukhi, Gujarati and Odia have no glyphs at all (11 Oct 2026).
 
 **Recorder** (`@zos/media`, `create(id.RECORDER)`)
 - Requires the undocumented permission `device:os.mic`; without it the recorder throws PERMISSION DENIED.
 - Output is **raw Opus packets in opus_demo framing**: `[4-byte BE length][4-byte final range][packet]`, not Ogg.
 - The encoding is **SILK wideband, 16 kHz mono, 60 ms single-frame packets** (TOC config 11, code 0), ~17 kbps, so about 10 KB per 5 s. libopus reproduces exactly this at 16–20 kbps with `application=voip`, `frame_duration=60` (`server/lezepplean/silk.py`).
-- Capture starts ~0.33–0.35 s after `start()`: 4680 ms is decoded from a ~5010 ms window. So clip timing is anchored on `stop()` (`sync.clipStartMs`).
-- Some firmware lacks the recorder events and `getStatus`, so don't rely on them.
-- A take started soon after a `stop()` (or a very short take) can produce a 0-byte file and lock the mic system-wide until reboot (forum #556). Keep takes ≥ 4 s and ≥ 8 s apart, or record continuously.
-- **Still unknown, and v0.2 depends on it:** whether the recording file is readable while recording is still running, and in what bursts. `lib/live.js` probes this at runtime (`firstGrowthMs`, `growths`, `probe` go to the server in every request's diagnostics, so `server/captures/*.json` answers it after the first session) and falls back to takes if it isn't.
+- Capture starts ~0.33–0.35 s after `start()`: 4680 ms is decoded from a ~5010 ms window, and a 2 s take holds 28 packets. So clip timing is anchored on `stop()` (`sync.clipStartMs`).
+- **On the T-Rex 3 the file is handed over only at `stop()`**: nothing can be read while it records (6.4.16.3, 10 Oct 2026). So the app runs on back-to-back takes; `live.js` still probes at runtime and is used where the file grows.
+- **One recorder at a time.** A second `create()` returns undefined until the first is garbage collected, so everything shares one (`recorder.microphone()`).
+- The START and STOP events arrive within ~5 ms on the T-Rex 3. Some firmware lacks them and `getStatus`, so `recorder.js` falls back to watching the file size.
+- Forum #556 reports a take started soon after a `stop()` (or a very short take) producing a 0-byte file and locking the mic until reboot. A T-Rex 3 (6.4.16.3) took 20 takes in a row 250 ms apart, each a full 28 packets, none empty (10 Oct 2026).
 
 **Loudness from packet bytes**
 - Packet sizes do not track loudness: the stream is near-constant bitrate (~120 B music vs ~108 B silence).
@@ -117,7 +131,7 @@ watch: lines [start, text, wordStarts|null, end|null]; the current line is one w
 
 **Phone link**
 - The watch has no internet. All traffic goes watch → BLE (ZML `request`, about 3.6 KB frames) → the side service inside the Zepp phone app → `fetch`.
-- The phone can't push unless the watch talked first.
+- The phone can't push unless the watch talked first. Once it has, the side service pushes with ZML `call`. Earphones mode relies on this: while the watch asks every 20 s, the side service long-polls `GET /phone/next` (8 s, inside the ~10 s limit below) and pushes each change of the player.
 - The first request after launch can fail while the side service cold-starts; the app retries.
 - Android side-service fetches reportedly drop after ~10 s of silence, so the server must answer in under 9 s. Self-signed HTTPS is rejected.
 - Plain `http://` to the LAN is reported to work but is unverified on the user's phone.
@@ -134,6 +148,10 @@ watch: lines [start, text, wordStarts|null, end|null]; the current line is one w
 - The duration comes from the Apple Music ID in Shazam's `hub.actions`, via an iTunes lookup.
 - If that fails, search and keep candidates within 3 s of the duration.
 - **Free word timings basically don't exist:** LRCLIB `hasWordSync` was 0 of 13 popular songs, and Unison was 0 of 5. So we compute them, from each song's audio fetched from YouTube with yt-dlp; the user accepted that this is against YouTube's terms.
+
+**Lyrics in English letters (roman.py)**
+- Written by Claude Haiku 5.5 through the homelab's auth2api: a forced tool call per 25 lines, the calls in parallel, the line count checked. 2.7–3.9 s a song, kept with it; Kesariya was identified in production in 1.4 s and its lyrics were in English letters ~4 s later (11 Oct 2026).
+- The prompt asks for fans' everyday spellings ("tujhe dekha toh"), not scholarly transliteration ("tujhe dekhā to"): that is what people can sing from.
 
 **The song's own audio (reference.py), measured 2026-10-10**
 - yt-dlp needs a JavaScript runtime for YouTube (Deno or Node; set in `reference._JS`). Without one it warns, offers fewer formats and gets intermittent HTTP 403s.
@@ -173,13 +191,22 @@ Blinding Lights in a simulated room calibrated to the watch's real levels (music
 | while playing | lyrics a median 23 ms from the music, within 100 ms 90% of the time |
 | word lit = word being sung | 82% (Blinding Lights), 95% (Wonderwall), 93% (a turntable 1% fast) |
 
+Takes mode, which is what the T-Rex 3 runs (`simulate.mjs --takes`, same song and room: a pause, talking during a pause, resumes; 10 Oct 2026):
+
+| | |
+|---|---|
+| lyrics frozen at the stop | 99 / 395 / 35 ms off |
+| after resuming | 15–63 ms off |
+| within 100 ms of the music | 100% |
+| word lit = word sung | 96% |
+
 These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_stream.py`; re-run them after touching `session.js`, `clock.js`, `activity.js` or `track.py`.
 
 ## Tooling gotchas
 
 - **Installing Zeus.** zeus-cli 1.9.3 crashes with `Cannot find module 'zeppos-app-utils'` under `npx @zeppos/zeus-cli` or a hoisted install. `watch-app/.npmrc` sets `install-strategy=nested`, which fixes it.
 - **Zepp login.** It needs an email + password Zepp account; Google or Apple sign-in doesn't work.
-- **Installing on the watch.** `zeus preview` goes through Zepp's cloud and the QR code lasts 7 days. Fallback: Zepp app → Developer Mode → Bridge, then `npx zeus bridge`.
+- **Installing on the watch.** `zeus preview` goes through Zepp's cloud and the QR code lasts 7 days. Fallback: Zepp app → Developer Mode → Bridge, then `npx zeus bridge`. The bridge drops after every install: reconnect before the next one, and trust only "Install lite app result: success".
 - **Targeting.** Use `platforms: [{ st: 'r', dw: 480 }]`, not `deviceSource`, which breaks the `zosLoader` per-screen layouts.
 - **Simulator.** Its T-Rex 3 image is API 4.0 only, with no BLE and a flaky side service, and media is likely unsupported. Test on the watch; for logic, use `tests/sim`.
 - **Background tasks.** Claude Code kills them after ~30 min. Long-running servers belong in the user's own terminal (`tools/serve.sh`).
@@ -190,10 +217,13 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 
 | Decision | Why |
 |---|---|
-| Music from speakers nearby, phone is Android | The user's choice. Earbud audio can't be heard by the watch mic, so a Spotify mode would be a separate feature |
+| Music from speakers nearby; music in earphones through the phone's player; the phone is Android | The user's choice. The mic can't hear earphones and the watch can't see the phone's player, so a helper on the phone reports it (any player with a media session: Spotify, YouTube Music, YouTube) |
 | ShazamIO; the server on the homelab (`charts/lezepplean`), the Mac only for working on it (`tools/serve.sh`) | The user's choice |
-| One continuous recording, read while written; takes only as a fallback | Takes leave 8 s gaps (mic-lock bug), so a pause could go unnoticed for 13 s |
-| Pause/resume decided on the watch from the SILK gain, backdated to the packet | No round trip: the lyrics stop within ~0.6 s and on the right word; a resume is confirmed by the server after 2 s of music |
+| Back-to-back takes, 250 ms apart: 5 s while finding the song, 3 s when the take will be sent, 2 s while following | The T-Rex 3 hands over a recording only when it stops, so a take's length is how late a pause or a resume can be noticed. 2 s is the shortest the server can place inside a song (1.56 s couldn't be) |
+| A take is sent only when an answer is needed, and never replaces a request in flight | Replacing it left the watch on "Listening…" while the answers kept arriving for takes already replaced |
+| A resume moves the lyrics only once the sound is shown to be the song where it stopped: first on the watch (the take's loudness against the song's loudness track near the expected position: r ≥ 0.6 over ≥ 23 packets, ≥ 0.7 over 17–22), otherwise by the server | In a simulated room, 1.4 s of the real song correlated ≥ 0.72 nine times in ten and was placed within a packet; talking never passed 0.47 |
+| A pause is dated from the first quiet packet of its stretch, or the middle of the gap between takes | Packets forgiven as noise used to restart the count, and a stop was dated 1.4 s late |
+| Pause/resume decided on the watch from the SILK gain, backdated to the packet | No round trip: the lyrics stop on the right word as soon as the watch has the audio (at the end of the take; ~0.6 s with a continuous recording) |
 | Thresholds measured on real recordings until the room's floor is known, then relative to floor and music | Fixed thresholds failed in a room with a louder floor; relative ones from the start were more sensitive than the real recordings justify |
 | The song's loudness track (envelope) sent to the watch, one character per 60 ms | Tells a quiet passage from a pause, catches a pause in a loud room, and notices skips without a request |
 | Song clock = line fit through matches in *playing time* (pauses cut out), Theil-Sen speed once matches span 30 s | Turntables run fast or slow; least squares let one outlier tilt the lyrics 85 ms |
@@ -213,17 +243,20 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 | The speech model's ONNX memory pool is sized exactly and emptied after each chunk; the separator keeps the default pool | The default pool grows by doubling and keeps everything: 2.1 GB after one new song, which killed the pod. Now 1.15 GB, identical output, ~3% more time. The separator's blocks are all one size, so its pool stops at ~300 MB, and the exact pool would cost it 20% |
 | Fast re-sync on the song's own audio, Shazam as fallback | ~30 ms instead of ~500 ms, works on 2 s, and is more consistent than Shazam on room audio |
 | Display timing: a line appears 300 ms early, a word lights 40 ms early, timers at exact change times | Reading ahead; drawing time |
+| A new song's name goes out within 1.5 s; its lyrics, if LRCLIB hasn't answered, as "pending", which the watch polls (1.5 s, then ×1.5 up to 10 s) | Lyrics first, words later. A slow LRCLIB used to hold the whole answer, and one failure showed as "no lyrics" for good |
+| Earphones mode: the phone's position, not audio. The server keeps the player's clock (offset = the fastest delivery among the recent updates), the side service long-polls and pushes, and the mic is off; after 60 s paused, the room is listened to again | Exact where the mic is an estimate, and pushed: a change reaches the watch without it asking. The mic would only hear the room |
+| Lyrics in a script the user doesn't read, or the watch can't draw, are written in English letters once per song by an LLM, and their words are timed in those letters | Fans sing from everyday spellings (dil, pyaar), which rule-based transliteration doesn't produce. One call per song costs ~3 s, once |
+| Native script only for the scripts ticked in the settings that the watch can draw, its letters reordered by `visual.py` (Tamil per consonant); Urdu without word timings | The font has the glyphs but doesn't shape them, and one widget per word would set Urdu's right-to-left words out left to right. Telugu, Punjabi, Gujarati and Odia always go out in English letters |
 
 ## Status
 
-**v0.2 is built and tested off the watch:** continuous listening with takes as fallback; word-by-word karaoke; pauses, resumes, skips and next songs followed; word timings computed on the server (CPU only); fast re-sync; the `known` handshake. 71 Node tests, 65 server tests, the JamendoLyrics benchmark, and the session simulator above. Four rounds of independent review found 12 bugs (and 6 risks), then 8, 3 and 1 more in the previous round's fixes, that the green suites had missed; a fifth round found nothing. All but one now have a test that failed before its fix; the exception (takes mode anchoring an answer on the wrong take) is in `page/home/index.js`, which Node can't load, and was fixed by reading.
+**0.2.8 is live** on the homelab and runs on the user's T-Rex 3: takes with resumes checked on the watch, word-by-word karaoke, pauses, resumes, skips and next songs followed, earphones mode with the helper (0.1.1), lyrics in English letters or in the scripts the user reads. Before it reached the watch, four rounds of independent review found 12 bugs (and 6 risks), then 8, 3 and 1 more in the previous round's fixes, that the green suites had missed; a fifth round found nothing. All but one now have a test that failed before its fix; the exception (takes mode anchoring an answer on the wrong take) is in `page/home/index.js`, which Node can't load, and was fixed by reading.
 
-**Needs the watch (none of this could be measured here):**
-1. Whether `live.js` sees the file grow while recording (check `client.firstGrowthMs` / `client.mode` in `server/captures/*.json`). If it doesn't, everything works in takes mode, with pauses noticed at the next take.
-2. The recorder's real flush cadence (the simulator assumed 240 ms) and the BLE throughput (it assumed 4 KB/s + 700 ms).
-3. Pause thresholds and the loudness-track comparison in real rooms. `node --test` on the Mac runs the local-only tests against `server/captures/`; they skip elsewhere.
-4. 24 word widgets and `getTextLayout` speed on the device; the layout cache and next-line preparation are there in case.
-5. The watch font's real widths (the screens in `tests/render` use Liberation Sans).
+**Open:**
+1. Finding takes of 3.5 s instead of 5 s: on room clips cut 3–4.7 s long, Shazam named the song 60–70% of the time at every length.
+2. YouTube music videos in earphones mode: the player's position is the video's, so a video with an intro runs the lyrics early. It needs the video mapped onto the song, as `reference.py` maps its own copies.
+3. Karaoke: someone singing over a track with no vocals.
+4. Not measured on the watch yet: the BLE throughput (the simulator assumes 4 KB/s + 700 ms), pause thresholds in more rooms, `getTextLayout` with 24 word widgets.
 
 ## Conventions
 
