@@ -234,3 +234,11 @@ def test_no_more_than_a_few_recordings_are_held_whatever_a_client_sends():
     r = listen.Listening("g", 0.0)
     r.put(10 * HALF_S, b"\x01\x00" * 4)  # 5 s past the end: not a lost piece, nothing held for it
     assert len(r.pcm) == 0
+
+
+def test_silence_is_passed_on_even_while_shazam_refuses_calls(api, monkeypatch):
+    client, app_module, _ = api
+    monkeypatch.setattr(app_module._recognizer, "cooling", lambda: 300.0)
+    r = client.post("/listen/audio", json={"session": "q3", "startedAt": time.time() * 1000, "offset": 0, "quiet": True}).json()
+    assert r["reason"] == "quiet"
+    assert client.get("/phone/next?since=-1&wait=0").json()["heard"]["quiet"] is True

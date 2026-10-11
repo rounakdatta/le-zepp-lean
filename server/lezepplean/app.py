@@ -513,13 +513,13 @@ async def listen_audio(req: ListenChunk, authorization: str | None = Header(None
     _phone.expire(t)
     if not rec.done and (_phone.now.playing or _phone.now.buffering):
         rec.finish("phone_playing")  # the phone's own player comes first: it is followed, not heard
+    if not rec.done and req.quiet and t - rec.start_at <= listen.MAX_AGE_S:
+        rec.finish("quiet")  # needs no Shazam call: passed on even while Shazam refuses
+        _phone.hear({"id": rec.id, "quiet": True}, t)  # a song only the phone heard has stopped
     if not rec.done and _recognizer.cooling():
         rec.finish("busy")  # Shazam is refusing calls: no point sending more
     if not rec.done and t - rec.start_at > listen.MAX_AGE_S:
         rec.finish("stale")  # held up somewhere: too old to name as what plays now
-    if not rec.done and req.quiet:
-        rec.finish("quiet")
-        _phone.hear({"id": rec.id, "quiet": True}, t)  # a song only the phone heard has stopped
     if not rec.done:
         rec.put(req.offset, base64.b64decode(req.pcm))
         if rec.due():

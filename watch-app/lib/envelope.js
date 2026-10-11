@@ -22,6 +22,22 @@ export function decodeEnvelope(env) {
   return { startMs: Number(env.startMs) || 0, stepMs: Number(env.stepMs) || 60, gains, version: env.version || null }
 }
 
+// Is the song itself quiet all through [fromMs, toMs]: even its loudest there `drop` below its
+// typical loudness (the median of its track)? An intro, a breakdown, a stop in the song.
+export function quietBetween(envelope, fromMs, toMs, drop) {
+  if (!envelope || !envelope.gains.length) return false
+  if (envelope.typical === undefined) {
+    const sorted = Array.from(envelope.gains).sort((a, b) => a - b)
+    envelope.typical = sorted[sorted.length >> 1]
+  }
+  const a = Math.max(0, Math.floor((fromMs - envelope.startMs) / envelope.stepMs))
+  const b = Math.min(envelope.gains.length - 1, Math.floor((toMs - envelope.startMs) / envelope.stepMs))
+  if (b < a) return false
+  let loudest = 0
+  for (let i = a; i <= b; i++) loudest = Math.max(loudest, envelope.gains[i])
+  return loudest < envelope.typical - drop
+}
+
 // Expected gain index at song position songMs, or null outside the song.
 export function expectedAt(envelope, songMs) {
   if (!envelope || songMs === null || songMs === undefined) return null

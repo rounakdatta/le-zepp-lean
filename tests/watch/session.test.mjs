@@ -1038,3 +1038,25 @@ test("in a room too loud for the watch to place its audio, its misses don't end 
   }
   assert.equal(s.song && s.song.id, 'wonderwall')
 })
+
+test("silence reported at the end of a song only the phone heard is the song ending, and the next is looked for", () => {
+  const s = session.createSession()
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard({ positionMs: 250_000 }) }, 10_000)
+  session.takeEvents(s)
+  session.onPhone(s, { version: 4, title: '', playing: false, heard: { id: 'r2', quiet: true } }, 15_000) // 3 s before its end
+  assert.equal(s.song, null)
+  assert.deepEqual(session.takeEvents(s).map((e) => e.type), ['ended'])
+  assert.ok(session.looking(s))
+})
+
+test("silence reported during a quiet part of the song (its own loudness track says so) doesn't stop it", () => {
+  const s = session.createSession()
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard({ positionMs: 60_000 }) }, 10_000)
+  // the track: loud, but quiet from 62 s to 70 s (a breakdown)
+  const data = Array.from({ length: 5000 }, (_, k) => (k * MS >= 62_000 && k * MS < 70_000 ? 'K' : 'c')).join('')
+  s.song.envelope = decodeEnvelope({ startMs: 0, stepMs: MS, data })
+  session.onPhone(s, { version: 4, title: '', playing: false, heard: { id: 'r2', quiet: true } }, 16_000) // at 66 s
+  assert.ok(!clock.isPaused(s.clock), 'the song is quiet there: not stopped')
+  session.onPhone(s, { version: 5, title: '', playing: false, heard: { id: 'r3', quiet: true } }, 25_000) // at 75 s: loud part
+  assert.ok(clock.isPaused(s.clock), 'quiet where the song is loud: stopped')
+})

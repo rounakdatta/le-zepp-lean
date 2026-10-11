@@ -13,7 +13,7 @@
 
 import * as clock from './clock.js'
 import * as activity from './activity.js'
-import { decodeEnvelope, expectedAt } from './envelope.js'
+import { decodeEnvelope, expectedAt, quietBetween } from './envelope.js'
 import { splitWords } from './sync.js'
 
 export const PACKET_MS = 60
@@ -65,6 +65,11 @@ const PHONE_IDLE_MS = 60000
 const PHONE_SEEK_MS = 1000
 const END_GRACE_MS = 2500
 const END_ZONE_MS = 5000 // music stopping this close to the end is the song ending, not a pause
+// The phone reporting silence (its first second quiet) is about the last ~3 s of the song,
+// given the time the report takes; a song this far below its typical loudness all through
+// them (~11 dB, as for the room) is in a quiet part of itself, not stopped.
+const QUIET_REPORT_SPAN_MS = 3000
+const QUIET_PART_DROP = 8
 // The room keeps ringing after the music stops, so the first packet quiet enough to count
 // comes a couple of packets late: in simulated rooms (RT60 0.45 s) the lyrics froze 150-210 ms
 // past the stop. A pause is dated this many packets before its first quiet packet.
@@ -548,6 +553,12 @@ function onHeard(s, h, now) {
     // The phone, whose mic named the song, hears nothing now: the music stopped (the watch's
     // mic couldn't tell). Its next listen that hears the song carries it on.
     if (s.heardOnly && isPlaying(s)) {
+      const pos = clock.songAt(s.clock, now)
+      if (quietBetween(s.song.envelope, pos - QUIET_REPORT_SPAN_MS, pos, QUIET_PART_DROP)) return // the song, quiet
+      if (s.song.durationMs && pos > s.song.durationMs - END_ZONE_MS) {
+        endSong(s) // the song finished: what comes next is looked for
+        return
+      }
       clock.pause(s.clock, now)
       s.stats.pauses += 1
       emit(s, 'pause', { at: now, source: 'heard' })
