@@ -21,9 +21,9 @@ class FakeShazam:
 
 
 def recognizer(answers, monkeypatch, clock):
+    monkeypatch.setattr(recognize.time, "monotonic", lambda: clock[0])
     r = recognize.Recognizer()
     r._shazam = FakeShazam(answers)
-    monkeypatch.setattr(recognize.time, "monotonic", lambda: clock[0])
     return r
 
 
@@ -66,6 +66,21 @@ def test_a_search_while_shazam_refuses_is_answered_at_once(api, monkeypatch):
     assert r["ok"] is False and r["reason"] == "recognizer_busy" and r["retryInMs"] == 42_000
 
 
+
+def test_no_burst_of_calls_goes_out_however_many_searches_come_in(monkeypatch):
+    clock = [0.0]
+    r = recognizer([{"matches": []}] * 40, monkeypatch, clock)
+    sent = 0
+    for _ in range(40):  # 40 searches at once: only a burst's worth reach Shazam
+        try:
+            asyncio.run(r.recognize(b""))
+            sent += 1
+        except recognize.RecognizerBusy as e:
+            assert 0 < e.retry_in <= recognize.REFILL_S
+    assert sent == recognize.BURST
+    clock[0] += 60  # a minute later: the budget is back
+    asyncio.run(r.recognize(b""))
+    assert r._shazam.calls == recognize.BURST + 1
 
 def test_a_429_is_a_refusal_even_with_a_json_body_never_a_song_not_found():
     from aiohttp import web

@@ -801,3 +801,129 @@ test('in takes mode, a "no" about sound from before the room went quiet again le
   const req = take(s, 627, 671, () => LOUD, 37_700, 40_400)
   assert.equal(req && req.purpose, 'resume')
 })
+
+// ---- the phone link (Bluetooth) dropping and coming back ----
+
+test('with the phone link down nothing is sent, and the moment it is back what waited goes', () => {
+  const s = following()
+  s.mode = 'takes'
+  s.nextLyricsAt = 0 // a word poll is due
+  session.onLink(s, false, 10_000)
+  assert.equal(session.decide(s, 10_100), null, 'nothing goes while the link is down')
+  assert.equal(take(s, 300, 344, () => LOUD, 10_000, 12_700), null)
+  assert.equal(s.takeSkip, 'link')
+  assert.equal(s.errors, 0, 'and nothing counts as an error')
+  const req = session.onLink(s, true, 20_000)
+  assert.equal(req && req.kind, 'lyrics', 'the waiting poll goes at once')
+})
+
+test('errors from before the link dropped hold nothing up once it is back', () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  const find = take(s, 0, 77, () => LOUD, 0, 5000)
+  // the link was going: four searches failed on the way, and the next waits 24 s
+  for (let k = 0; k < 4; k++) session.onResponse(s, find, { ok: false, reason: 'phone' }, 5000 + k)
+  assert.ok(s.holdUntil >= 29_000)
+  session.onLink(s, false, 6000)
+  session.onLink(s, true, 9000)
+  const again = take(s, 82, 159, () => LOUD, 9000, 14_000)
+  assert.equal(again && again.purpose, 'find', 'the first take after the link is back goes')
+})
+
+// ---- priority: the phone's player first; when it doesn't play, the mics ----
+
+test('the phone paused: the mics look for a song, and one found in the room takes over', () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  onPhone(s, 0, { version: 1, title: 'Champagne Supernova', songId: 'champagne', positionMs: 30_000 })
+  assert.equal(session.takeRequest(s, 0, 77, 0, 5000), null, 'playing: the mics are off')
+  onPhone(s, 6000, { version: 2, title: 'Champagne Supernova', songId: 'champagne', playing: false, positionMs: 36_000 })
+  assert.ok(session.looking(s))
+  assert.equal(session.wantsAudio(s, 6000), true, 'a take long enough to find a song')
+  const find = take(s, 100, 177, () => LOUD, 6500, 11_500)
+  assert.equal(find && find.purpose, 'find')
+  assert.equal(s.song.title, 'Champagne Supernova', 'the paused song stays up meanwhile')
+  session.onResponse(s, find, found(5000), 12_000)
+  assert.equal(s.song.title, 'Wonderwall', 'the room took over')
+  assert.equal(s.source, 'room')
+  // and the phone playing again takes over at once
+  onPhone(s, 20_000, { version: 3, title: 'Champagne Supernova', songId: 'champagne', positionMs: 37_000 })
+  assert.equal(s.song.title, 'Champagne Supernova')
+  assert.ok(session.phonePlaying(s))
+})
+
+test('a song found while the phone was paused does not replace it once it plays again', () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  onPhone(s, 0, { version: 1, title: 'Champagne Supernova', songId: 'champagne', positionMs: 30_000 })
+  onPhone(s, 6000, { version: 2, title: 'Champagne Supernova', songId: 'champagne', playing: false, positionMs: 36_000 })
+  const find = take(s, 100, 177, () => LOUD, 6500, 11_500)
+  onPhone(s, 11_800, { version: 3, title: 'Champagne Supernova', songId: 'champagne', positionMs: 36_000 }) // play again
+  session.onResponse(s, find, found(5000), 12_000)
+  assert.equal(s.song.title, 'Champagne Supernova', 'the phone playing comes first')
+  assert.ok(session.phonePlaying(s))
+})
+
+// ---- what the phone's mic heard ----
+
+const heard = (v) => ({ id: 'r1', songId: 'wonderwall', title: 'Wonderwall', artist: 'Oasis', durationMs: 258_000, positionMs: 41_000, ...v })
+
+test("the phone's mic names the song while the watch looks: it starts there, and its lyrics are asked for at once", () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard() }, 10_000)
+  assert.equal(s.song && s.song.title, 'Wonderwall')
+  assert.equal(s.source, 'room', 'the room is the clock: the watch follows it from here')
+  assert.equal(Math.round(session.position(s, 12_000)), 43_000)
+  assert.equal(session.takeEvents(s).some((e) => e.type === 'song'), true)
+  const poll = session.decide(s, 10_000)
+  assert.equal(poll && poll.kind, 'lyrics')
+  // the watch's own search gets there too: same song, it only refines where it is
+  const own = take(s, 0, 77, () => LOUD, 5_500, 10_500)
+  assert.equal(own, null, 'one request at a time')
+  session.onResponse(s, poll, { ok: true, song: { id: 'wonderwall' }, lyrics: { version: 'v1', kind: 'synced', lines: LINES }, words: { status: 'ready' } }, 11_000)
+  assert.equal(s.song.kind, 'synced')
+})
+
+test("what the phone's mic names never replaces the phone's playing song, nor a song followed in the room", () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, title: 'Champagne Supernova', songId: 'champagne', positionMs: 30_000 })
+  session.onPhone(s, { version: 2, title: 'Champagne Supernova', artist: 'Oasis', durationMs: 258_000, playing: true, positionMs: 32_000, speed: 1, songId: 'champagne', heard: heard() }, 2000)
+  assert.equal(s.song.title, 'Champagne Supernova')
+  const r = following()
+  r.mode = 'takes'
+  session.onPhone(r, { version: 1, title: '', playing: false, heard: heard({ id: 'r2', songId: 'other', title: 'Other' }) }, 9000)
+  assert.equal(r.song.id, 'wonderwall', 'a song followed in the room stays')
+})
+
+test("the same news from the phone's mic, passed on twice, starts the song once", () => {
+  const s = session.createSession()
+  session.onPhone(s, { version: 3, title: '', playing: false, heard: heard() }, 10_000)
+  session.takeEvents(s)
+  session.onPhone(s, { version: 4, title: '', playing: false, heard: heard({ positionMs: 45_000 }) }, 14_000)
+  assert.deepEqual(session.takeEvents(s).filter((e) => e.type === 'song'), [])
+  assert.equal(Math.round(session.position(s, 14_000)), 45_000)
+})
+
+// ---- the server unable to answer (Shazam refusing calls) ----
+
+test('while Shazam refuses calls the watch holds its song searches until the server says, then goes on', () => {
+  const s = session.createSession()
+  s.mode = 'takes'
+  const find = take(s, 0, 77, () => LOUD, 0, 5000)
+  session.onResponse(s, find, { ok: false, reason: 'recognizer_busy', retryInMs: 20_000 }, 5500)
+  assert.equal(take(s, 82, 140, () => LOUD, 5600, 9000), null, 'held: it would only be refused too')
+  assert.equal(s.takeSkip, 'busy')
+  const later = take(s, 300, 360, () => LOUD, 25_600, 29_000)
+  assert.equal(later && later.purpose, 'find', 'and searching again once the server said it could')
+})
+
+test("a re-sync the server couldn't answer never ends the song", () => {
+  const s = following()
+  for (let k = 0; k < 5; k++) {
+    const req = { id: 900 + k, kind: 'identify', purpose: 'sync', song: 'wonderwall', startAt: 10_000 + k * 1000, from: 0, to: 49 }
+    session.onResponse(s, req, { ok: false, reason: k % 2 ? 'recognizer_busy' : 'recognizer_timeout' }, 20_000 + k * 1000)
+  }
+  assert.equal(s.song && s.song.id, 'wonderwall')
+  assert.ok(s.nextVerifyAt > 24_000, 'and the next re-sync comes later')
+})

@@ -21,11 +21,12 @@ export const IDENTIFY_PACKETS = 84 // 5 s: what Shazam needs to be sure
 export const VERIFY_PACKETS = 50 // 3 s: enough to place audio inside a song the server knows
 export const RESUME_PACKETS = 34 // 2 s of the music after it comes back
 export const CHECK_PACKETS = 70 // 4.2 s after a suspected skip: enough for Shazam if it's another song
-// Takes mode: a take must be this long to be worth asking Shazam about (a 5 s take holds
-// ~78 packets: the mic starts ~0.32 s after start()), and this long to place inside a song
+// Takes mode: a take must be this long to be worth asking Shazam about (a 3.5 s take holds
+// ~53 packets: the mic starts ~0.32 s after start(); on room clips cut 3-4.7 s long Shazam
+// named the song 60-70% of the time at every length), and this long to place inside a song
 // the server knows: fast re-sync was measured on 2 s windows, and on a T-Rex 3 the 1.56 s
 // left of a take after the music came back could not be placed.
-export const FIND_TAKE_PACKETS = 60
+export const FIND_TAKE_PACKETS = 50
 export const PLACE_TAKE_PACKETS = 34
 // Takes mode: sound coming back during a pause moves the lyrics only once it is shown to be
 // the song, where it stopped. First on the watch: the room's loudness against the song's
@@ -96,6 +97,8 @@ export function createSession() {
     nextVerifyAt: 0,
     nextLyricsAt: Infinity,
     holdUntil: 0, // after errors: no requests before this
+    findHoldUntil: 0, // Shazam refusing calls (the server says until when): no song searches before this
+    linkUp: true, // the Bluetooth link to the phone (see onLink)
     resumeCheck: null, // { from, due }: confirm a resume once `due` arrives
     doubt: null, // { due, wait }: a "resume" the server couldn't place; the room is loud, the lyrics frozen
     provisional: false, // resumed on loudness alone; the server hasn't confirmed it is the song yet
@@ -135,6 +138,17 @@ export function isPlaying(s) {
   return !!s.song && clock.isKnown(s.clock) && !clock.isPaused(s.clock)
 }
 
+// The phone's player is playing: it is the clock, and nothing the mics hear changes that.
+export function phonePlaying(s) {
+  return s.source === 'phone' && !!s.phone && s.phone.playing
+}
+
+// Nothing to follow in the room: no song yet, or only the phone's, paused. The mics look
+// for one (the watch's, and the phone's when it listens too), and what they find takes over.
+export function looking(s) {
+  return !s.song || (s.source === 'phone' && !phonePlaying(s))
+}
+
 function emit(s, type, extra) {
   const e = extra || {}
   e.type = type
@@ -144,7 +158,7 @@ function emit(s, type, extra) {
 // ---- input: packets ---------------------------------------------------------------
 
 export function onPacket(s, index, gain, at, now) {
-  if (s.source === 'phone') return null // the phone says what plays; the room says nothing now
+  if (phonePlaying(s)) return null // the phone's player is the clock; the room says nothing now
   if (s.last >= 0 && index > s.last + 1) {
     s.gapFrom = s.last + 1
     s.gapTo = index - 1
@@ -157,7 +171,7 @@ export function onPacket(s, index, gain, at, now) {
   // The music level is only learned while the song is confirmed playing: someone talking at
   // the wrist during a pause, taken for a resume, taught it 38 where the music was 28, and the
   // music could then never resume again.
-  s.act.learn = !s.song || (isPlaying(s) && !s.provisional)
+  s.act.learn = looking(s) || (isPlaying(s) && !s.provisional)
   const ev = activity.pushLevel(s.act, gain, index, expected)
   s.stats.quietForgiven = s.act.expectedQuiet
   if (ev) onActivity(s, ev)
@@ -231,6 +245,7 @@ function correlation(a, b, minN) {
 }
 
 function onActivity(s, ev) {
+  if (s.source === 'phone') return // its player paused: the room's stops and starts aren't its song's
   let at = packetTime(s, ev.type === 'pause' ? ev.packet - PAUSE_TAIL_PACKETS : ev.packet)
   if (ev.type === 'pause' && ev.packet === s.gapTo + 1) {
     // The quiet began between two takes: somewhere between the last packet heard and this
@@ -343,7 +358,7 @@ function request(s, kind, purpose, from, to, now, startAtOverride) {
 // Takes mode: will the next take probably go to the server? Then the page makes it long
 // enough to place (a resume to confirm, a re-sync due, a suspected skip, SELECT).
 export function wantsAudio(s, now) {
-  if (!s.song || s.wantCheck || s.check) return true
+  if (looking(s) || s.wantCheck || s.check) return true
   if (s.comeback) return s.comeback.failed || !s.song.envelope
   if (s.resumeCheck && !clock.isPaused(s.clock)) return true
   return isPlaying(s) && now >= s.nextVerifyAt
@@ -357,7 +372,7 @@ export function wantsAudio(s, now) {
 // a find whose lyrics took 6 s was replaced every time, and the song never appeared.)
 export function takeRequest(s, from, to, startAt, now) {
   s.takeSkip = null
-  if (s.source === 'phone') return null
+  if (phonePlaying(s)) return null
   // Sound back during a pause is first placed on the watch, against the song's own loudness
   // track. That needs no server, so it doesn't wait for one (a word poll out, an error
   // back-off). This take alone: what came before it may be someone talking, or the gap.
@@ -372,8 +387,8 @@ export function takeRequest(s, from, to, startAt, now) {
       s.comeback.failed = true // the song's track can't say: ask the server
     }
   }
-  if (s.inflight || s.noServer || now < s.holdUntil) {
-    s.takeSkip = 'busy'
+  if (s.inflight || s.noServer || now < s.holdUntil || !s.linkUp) {
+    s.takeSkip = s.linkUp ? 'busy' : 'link'
     return null
   }
   if (placed) {
@@ -383,12 +398,16 @@ export function takeRequest(s, from, to, startAt, now) {
   const n = to - from + 1
   // SELECT: this take, if it is long enough to answer. The one recording when SELECT came may
   // be a 2 s take: then the next one, made long enough (see wantsAudio), is sent instead.
-  if (s.wantCheck && n >= (s.song && s.song.fast ? PLACE_TAKE_PACKETS : FIND_TAKE_PACKETS)) {
+  if (s.wantCheck && n >= (looking(s) || !s.song.fast ? FIND_TAKE_PACKETS : PLACE_TAKE_PACKETS)) {
     s.wantCheck = false
-    const purpose = !s.song ? 'find' : clock.isPaused(s.clock) ? 'resume' : 'sync'
+    const purpose = looking(s) ? 'find' : clock.isPaused(s.clock) ? 'resume' : 'sync'
     return request(s, 'identify', purpose, from, to, now, startAt)
   }
-  if (!s.song) {
+  if (looking(s)) {
+    if (now < s.findHoldUntil) {
+      s.takeSkip = 'busy'
+      return null
+    }
     if (n >= FIND_TAKE_PACKETS && loudShare(s, from, to) >= LOUD_SHARE) {
       return request(s, 'identify', 'find', from, to, now, startAt)
     }
@@ -490,11 +509,34 @@ function resumeAt(s, v, now) {
 
 // ---- input: the phone ---------------------------------------------------------------
 
-// What the phone is playing, from the LeZeppLean helper on it via the server: `view` is
-// { version, title, artist, durationMs, playing, positionMs (as of `now`), speed, songId }.
-// While the phone plays, it is the clock: exact, and the only way to follow music in
-// earphones. Returns true while the phone is what is followed.
+// What the phone says, from the LeZeppLean helper on it via the server: what its player
+// plays (`view`: { version, title, artist, durationMs, playing, positionMs (as of `now`),
+// speed, songId }) and what its mic named (`view.heard`). The player comes first: while it
+// plays it is the clock, exact, and the only way to follow music in earphones, and nothing
+// the mics hear changes that. Returns true while the phone's player is what is followed.
 export function onPhone(s, view, now) {
+  if (!view || typeof view.version !== 'number') return s.source === 'phone'
+  followPlayer(s, view, now)
+  if (view.heard) onHeard(s, view.heard, now)
+  return s.source === 'phone'
+}
+
+// The phone's mic named a song: { id, songId, title, artist, durationMs, positionMs (as of
+// `now`) }. Taken while the watch is looking (no song, or only the phone's, paused): the
+// watch's own search, if it gets there too, then only refines where the song is.
+function onHeard(s, h, now) {
+  if (!h.id || !h.songId || h.id === s.heardId) return
+  s.heardId = h.id
+  if (!looking(s)) return
+  if (s.source === 'phone') leavePhone(s)
+  const song = { id: h.songId, title: h.title, artist: h.artist, durationMs: h.durationMs }
+  startSong(s, { song, match: { offsetMs: h.positionMs, skew: 0 } }, { startAt: now, from: s.last + 1 }, now)
+  s.song.kind = 'pending' // its lyrics are asked for at once
+  s.nextLyricsAt = now
+  s.nextVerifyAt = now + VERIFY_STEPS_MS[0]
+}
+
+function followPlayer(s, view, now) {
   if (!view || typeof view.version !== 'number') return s.source === 'phone'
   if (s.phone && view.version === s.phone.version && view.title === s.phone.title) return s.source === 'phone'
   const track = view.title ? view.title + '\u0000' + (view.artist || '') : ''
@@ -561,6 +603,19 @@ function leavePhone(s) {
   s.nextIdentifyPacket = s.last + 1
 }
 
+// The Bluetooth link to the phone, as the page polls it. While it is down nothing is sent: a
+// request then fails at once, and counted as an error it held off the next one for up to
+// 24 s after the link was back. The moment the link is back, whatever waited goes.
+export function onLink(s, up, now) {
+  if (up === s.linkUp) return null
+  s.linkUp = up
+  emit(s, up ? 'link_up' : 'link_down')
+  if (!up) return null
+  s.errors = 0
+  s.holdUntil = 0
+  return decide(s, now)
+}
+
 // SELECT or a tap: check now. Paused or not, with or without a song: the person is the
 // judge that something is off, and nothing else would send audio while paused.
 export function checkNow(s, now) {
@@ -571,19 +626,20 @@ export function checkNow(s, now) {
 }
 
 export function decide(s, now) {
-  if (s.inflight || s.noServer || now < s.holdUntil) return null
+  if (s.inflight || s.noServer || now < s.holdUntil || !s.linkUp) return null
   if (s.source === 'phone') {
-    // The phone says where the song is: only lyrics and word timings are asked for.
+    // The phone says where its song is: lyrics and word timings are all that is asked for.
     if (now >= s.nextLyricsAt && s.song && s.song.id) {
       s.nextLyricsAt = Infinity
       return request(s, 'lyrics', 'words', -1, -1, now)
     }
-    return null
+    // Its player paused, the mics look for a song (in takes mode, the takes carry that).
+    if (phonePlaying(s) || s.mode === 'takes') return null
   }
   if (s.wantCheck && s.mode !== 'takes' && s.last >= VERIFY_PACKETS - 1) {
     s.wantCheck = false
-    const n = !s.song || clock.isPaused(s.clock) || !s.song.fast ? IDENTIFY_PACKETS : VERIFY_PACKETS
-    const purpose = !s.song ? 'find' : clock.isPaused(s.clock) ? 'resume' : 'sync'
+    const n = looking(s) || clock.isPaused(s.clock) || !s.song.fast ? IDENTIFY_PACKETS : VERIFY_PACKETS
+    const purpose = looking(s) ? 'find' : clock.isPaused(s.clock) ? 'resume' : 'sync'
     return request(s, 'identify', purpose, Math.max(0, s.last - n + 1), s.last, now)
   }
   if (s.mode === 'takes') {
@@ -607,7 +663,7 @@ export function decide(s, now) {
     return request(s, 'identify', 'resume', s.last - IDENTIFY_PACKETS + 1, s.last, now)
   }
   // 2. No song yet: identify once there are 5 s that are mostly music.
-  if (!s.song) {
+  if (looking(s)) {
     if (s.last >= s.nextIdentifyPacket && s.last >= IDENTIFY_PACKETS - 1) {
       const from = s.last - IDENTIFY_PACKETS + 1
       if (loudShare(s, from, s.last) >= LOUD_SHARE) {
@@ -643,9 +699,9 @@ export function decide(s, now) {
 
 export function onResponse(s, req, res, now) {
   if (s.inflight && s.inflight.id === req.id) s.inflight = null
-  // The phone took over while this was out: what the mic heard is moot (a café's song, found
-  // after the earphones started, replaced the song playing in them).
-  if (s.source === 'phone' && req.kind === 'identify') return
+  // The phone's player plays: what the mics heard is moot (a café's song, found after the
+  // earphones started, replaced the song playing in them).
+  if (phonePlaying(s) && req.kind === 'identify') return
   res = res || {}
   if (res.reason === 'no_server') {
     s.noServer = true
@@ -677,6 +733,9 @@ export function onResponse(s, req, res, now) {
   const id = res.song ? res.song.id : null
   const offset = res.match ? res.match.offsetMs : null
   if (offset === null || offset === undefined || req.startAt === null) return
+  // Found by the mics while the phone's player is paused: the room is the clock now (if
+  // the phone plays again, it takes over again).
+  if (s.source === 'phone') leavePhone(s)
   if (!s.song || s.song.id !== id) {
     startSong(s, res, req, now)
   } else {
@@ -728,6 +787,8 @@ export function onResponse(s, req, res, now) {
 
 function onMiss(s, req, res, now) {
   if (req.purpose === 'find') {
+    // Shazam refusing calls: the takes meanwhile would only be refused too (and cost Bluetooth)
+    if (res.reason === 'recognizer_busy') s.findHoldUntil = now + (res.retryInMs || 30000)
     emit(s, 'miss', { reason: res.reason })
     return
   }
@@ -772,6 +833,12 @@ function onMiss(s, req, res, now) {
     return
   }
   // A periodic check failed. Keep the lyrics running; two in a row and look for a new song.
+  // Unless the server couldn't say (Shazam refusing calls, a timeout): that says nothing about
+  // the song, and three such in a row used to end it.
+  if (res.reason !== 'no_match' && res.reason !== 'bad_audio') {
+    s.nextVerifyAt = now + 15000
+    return
+  }
   s.misses += 1
   s.nextVerifyAt = now + (s.misses >= 2 ? 5000 : 15000)
   if (s.misses >= 3) {

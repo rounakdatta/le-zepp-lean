@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 STALE_S = 35.0  # no word from the helper this long while "playing" (it heartbeats every 10 s): don't trust it
 OFFSET_SAMPLES = 40
+HEARD_FRESH_S = 20.0  # what the phone's mic named (listen.py) is offered to the watch this long
 
 
 @dataclass
@@ -45,6 +46,21 @@ class Phone:
         self.now = Snapshot()
         self._changed = asyncio.Event()
         self._lags: deque[float] = deque(maxlen=OFFSET_SAMPLES)
+        self.heard: dict | None = None
+        self.heard_at = 0.0
+
+    def clock(self, sent_ms, received: float) -> float:
+        """Add this to a time on the phone's clock (ms) for the server's. The fastest delivery
+        seen bounds the difference best."""
+        if isinstance(sent_ms, (int, float)) and sent_ms > 0:
+            self._lags.append(received * 1000 - sent_ms)
+        return min(self._lags) if self._lags else 0.0
+
+    def hear(self, heard: dict, t: float) -> None:
+        """The phone's mic named a song (listen.py): the watch hears of it like any change.
+        `heard` holds where the song was at `t`."""
+        self.heard, self.heard_at = heard, t
+        self.bump()
 
     def position(self, t: float) -> float:
         s = self.now
@@ -66,9 +82,7 @@ class Phone:
         sent = body.get("sentAt")
         late_ms = 0.0
         if isinstance(sent, (int, float)) and sent > 0:
-            lag = received * 1000 - sent
-            self._lags.append(lag)
-            late_ms = max(0.0, lag - min(self._lags))
+            late_ms = max(0.0, received * 1000 - sent - self.clock(sent, received))
         title = str(body.get("title") or "").strip()
         artist = str(body.get("artist") or "").strip()
         app = str(body.get("app") or "")
@@ -128,6 +142,8 @@ class Phone:
             "speed": s.speed,
             "songId": s.song_id,
             "ageMs": round((t - s.updated) * 1000) if s.updated else None,
+            "heard": ({**self.heard, "positionMs": round(self.heard["positionMs"] + (t - self.heard_at) * 1000)}
+                      if self.heard and t - self.heard_at < HEARD_FRESH_S else None),
         }
 
 

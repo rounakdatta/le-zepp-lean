@@ -25,6 +25,12 @@ export class Vibrator {
   stop() {}
 }
 
+// @zos/ble: the phone link, up unless a test says otherwise
+export const ble = { up: true }
+export function connectStatus() {
+  return ble.up
+}
+
 // @zos/settings
 export function getSystemInfo() {
   return { minAPI: '5.0', firmwareVersion: 'test' }

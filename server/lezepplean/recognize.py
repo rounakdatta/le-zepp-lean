@@ -28,6 +28,10 @@ log = logging.getLogger("lezepplean.recognize")
 # 11 Oct 2026 a burst of ~100 calls got the homelab's address rate-limited, and every
 # song search the watch then made (several requests each) kept the limit going.
 COOL_S = (30, 60, 120, 300, 600)
+# And never more than this many calls in a burst, refilled at one per REFILL_S (10 a minute):
+# a song search costs 1-3 calls, a new song's reference check 5.
+BURST = 10
+REFILL_S = 6.0
 
 
 class RecognizerBusy(Exception):
@@ -82,13 +86,21 @@ class Recognizer:
         self._shazam = Shazam(http_client=_Http())
         self._cool_until = 0.0
         self._refusals = 0
+        self._tokens = float(BURST)
+        self._filled_at = time.monotonic()
 
     async def recognize(self, wav: bytes) -> Match | None:
         """The song in `wav`, None when Shazam doesn't know it. RecognizerBusy while Shazam is
-        refusing calls: then nothing is sent at all, so the refusal can wear off."""
-        wait = self._cool_until - time.monotonic()
+        refusing calls, or the budget of calls is spent: then nothing is sent at all."""
+        now = time.monotonic()
+        wait = self._cool_until - now
         if wait > 0:
             raise RecognizerBusy(wait)
+        self._tokens = min(BURST, self._tokens + max(0.0, now - self._filled_at) / REFILL_S)
+        self._filled_at = now
+        if self._tokens < 1:
+            raise RecognizerBusy((1 - self._tokens) * REFILL_S)
+        self._tokens -= 1
         try:
             result = await self._shazam.recognize(wav)
         except _Refused as e:

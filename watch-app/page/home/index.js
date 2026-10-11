@@ -21,6 +21,7 @@ import { onKey, offKey, KEY_UP, KEY_DOWN, KEY_SELECT, KEY_EVENT_CLICK, KEY_EVENT
 import { setPageBrightTime, resetPageBrightTime, pauseDropWristScreenOff, resetDropWristScreenOff } from '@zos/display'
 import { Vibrator, VIBRATOR_SCENE_SHORT_STRONG } from '@zos/sensor'
 import { getSystemInfo } from '@zos/settings'
+import { connectStatus } from '@zos/ble'
 import { log } from '@zos/utils'
 import { BasePage } from '@zeppos/zml/base-page'
 import { recordClip } from '../../lib/recorder.js'
@@ -43,7 +44,7 @@ const REQUEST_TIMEOUT_MS = 25000
 const TICK_MS = 200
 const HINT_MS = 8000 // the key hint shows when the first lyrics do, then gets out of the way
 // Takes (fallback when the recording can't be read while it's written)
-const FIND_TAKE_MS = 5000
+const FIND_TAKE_MS = 3500 // what Shazam needs to name a song (see session.FIND_TAKE_PACKETS)
 const PLACE_TAKE_MS = 3000 // ~2.7 s of audio: enough to place inside a song the server knows
 const FOLLOW_TAKE_MS = 2000
 // Between one take's end and the next start(). Some watches lock the mic when it restarts
@@ -179,13 +180,14 @@ function startListening() {
 // ---- the phone's own player ---------------------------------------------------------
 
 // What the phone is playing (the LeZeppLean helper on it reports to the server; the relay
-// passes it on). Asking also keeps the relay following it, and times the link.
+// passes it on). Asking also keeps the relay following it, and times the link; while the
+// watch looks for a song, it asks the phone to listen too.
 function askPhone() {
   clearTimeout(phoneTimer)
   phoneTimer = setTimeout(guard('askPhone', askPhone), PHONE_ASK_MS)
   const sentAt = Date.now()
   page
-    .request({ method: 'phone', params: {} }, { timeout: 8000 })
+    .request({ method: 'phone', params: { listen: session.looking(s) } }, { timeout: 8000 })
     .then(guard('phoneAnswer', (view) => {
       const trip = Date.now() - sentAt
       if (trip < 2000) bleOneWayMs = Math.round(bleOneWayMs * 0.7 + (trip / 2) * 0.3)
@@ -199,7 +201,9 @@ function onPhoneView(pv, trip) {
   const now = Date.now()
   // the relay's position is as of when it sent it; it has been on its way since
   const late = trip !== null ? trip / 2 : bleOneWayMs
-  const v = pv.playing ? Object.assign({}, pv, { positionMs: pv.positionMs + late * (pv.speed || 1) }) : pv
+  const v = Object.assign({}, pv)
+  if (pv.playing) v.positionMs = pv.positionMs + late * (pv.speed || 1)
+  if (pv.heard) v.heard = Object.assign({}, pv.heard, { positionMs: pv.heard.positionMs + late })
   session.onPhone(s, v, now)
   handleEvents()
   refresh()
@@ -207,13 +211,12 @@ function onPhoneView(pv, trip) {
   if (next) send(next, null)
 }
 
-// The recorder follows the session: off while the phone is the clock (music in earphones
-// can't be heard anyway), back on when the session returns to the room, whatever moved it
-// (a minute paused is noticed by the session's own clock, with no word from the phone).
-// It comes back the way this watch records, after the usual gap, and never over a take
-// still recording: the watch has one recorder.
+// The recorder follows the session: off while the phone's player plays (it is the clock, and
+// music in earphones can't be heard anyway), on whenever it doesn't, paused too: then the
+// mics look for a song in the room. It comes back the way this watch records, after the
+// usual gap, and never over a take still recording: the watch has one recorder.
 function followSource() {
-  if (s.source === 'phone') {
+  if (session.phonePlaying(s)) {
     if (mode === 'phone') return
     mode = 'phone'
     diag.mode = 'phone'
@@ -226,7 +229,6 @@ function followSource() {
     return
   }
   if (mode !== 'phone') return
-  view.showMessage('Listening…', 'Hold the watch near the music')
   mode = s.mode === 'takes' ? 'takes' : 'starting'
   diag.mode = mode
   if (mode === 'takes') {
@@ -249,7 +251,7 @@ function scheduleTake(ms) {
 // place, 3 s when the take will go to the server, else 2 s, so the music stopping is
 // heard soon after.
 function takeMs() {
-  if (!s.song || !s.song.fast || s.doubt) return FIND_TAKE_MS
+  if (session.looking(s) || !s.song.fast || s.doubt) return FIND_TAKE_MS
   return session.wantsAudio(s, Date.now()) ? PLACE_TAKE_MS : FOLLOW_TAKE_MS
 }
 
@@ -317,7 +319,7 @@ function onTake(take) {
     logger.info('take ' + takesSeen + ' gains ' + g.join(' '))
   }
   handleEvents()
-  view.setListening(!s.song) // the ring's listening colour means "looking for a song"
+  view.setListening(session.looking(s)) // the ring's listening colour means "looking for a song"
   const req = session.takeRequest(s, base, takeLast, firstAt, now)
   if (!req) {
     if (!s.song && s.takeSkip === 'quiet') view.showMessage('Listening…', 'Waiting for the music')
@@ -406,9 +408,10 @@ function handleEvents() {
     } else if (e.type === 'resume' || e.type === 'resume_rejected') {
       view.setPaused(e.type === 'resume_rejected')
     } else if ((e.type === 'ended' || e.type === 'lost') && e.source === 'phone') {
-      clearTimeout(lineTimer) // the room is listened to again (onPhoneView says so)
+      clearTimeout(lineTimer) // the room is the clock again (unless what it plays has taken over already)
       view.setPaused(false)
       view.setSongProgress(0)
+      if (!s.song) view.showMessage('Listening…', 'Hold the watch near the music')
     } else if (e.type === 'ended' || e.type === 'lost') {
       clearTimeout(lineTimer)
       view.setPaused(false)
@@ -417,6 +420,10 @@ function handleEvents() {
     } else if (e.type === 'no_server') {
       view.showMessage('Server not set', 'Zepp app → LeZeppLean → settings')
       view.setStatus('Then press SELECT')
+    } else if (e.type === 'link_down') {
+      view.setStatus('Waiting for your phone')
+    } else if (e.type === 'link_up') {
+      view.setStatus('')
     } else if (e.type === 'problem') {
       view.setStatus(problemText(e.reason))
     } else if (e.type === 'miss' && !s.song) {
@@ -485,6 +492,11 @@ function tick() {
     s.mode = 'takes'
     lastStopAt = now
     scheduleTake(TAKE_GAP_MS)
+  }
+  const up = linkUp()
+  if (up !== s.linkUp) {
+    afterSession(session.onLink(s, up, now), now)
+    if (up) askPhone() // and the relay follows the phone's player again
   }
   const req = session.onTick(s, now)
   afterSession(req, now)
@@ -581,6 +593,16 @@ function refreshDebug() {
       diag.problem ? 'last problem: ' + diag.problem : '',
     ].join('\n'),
   )
+}
+
+// The Bluetooth link to the phone. Polled, not listened to: ZML holds the one connection
+// listener there is, and replacing it would break its own reconnecting.
+function linkUp() {
+  try {
+    return connectStatus() !== false
+  } catch (e) {
+    return true // no way to tell: requests will say
+  }
 }
 
 function hint() {
