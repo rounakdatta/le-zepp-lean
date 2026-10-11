@@ -9,16 +9,17 @@ conjuncts still show their joining mark (क्ष as क्‍ष), which reade
 
 from __future__ import annotations
 
-# script: (consonants, nukta, virama, signs drawn before the cluster, two-part signs -> (before, after))
+# script: (consonant ranges, nukta, virama, signs drawn before the cluster, two-part signs -> (before, after))
 _SCRIPTS = {
-    "Devanagari": ((0x0915, 0x0939), (0x0958, 0x095F), 0x093C, 0x094D, {0x093F}, {}),
-    "Bengali": ((0x0995, 0x09B9), (0x09DC, 0x09DF), 0x09BC, 0x09CD, {0x09BF, 0x09C7, 0x09C8},
+    "Devanagari": (((0x0915, 0x0939), (0x0958, 0x095F)), 0x093C, 0x094D, {0x093F}, {}),
+    # with Assamese ৰ and ৱ (the "Bengali, Assamese" setting)
+    "Bengali": (((0x0995, 0x09B9), (0x09DC, 0x09DF), (0x09F0, 0x09F1)), 0x09BC, 0x09CD, {0x09BF, 0x09C7, 0x09C8},
                 {0x09CB: (0x09C7, 0x09BE), 0x09CC: (0x09C7, 0x09D7)}),
-    "Gurmukhi": ((0x0A15, 0x0A39), (0x0A59, 0x0A5E), 0x0A3C, 0x0A4D, {0x0A3F}, {}),
-    "Gujarati": ((0x0A95, 0x0AB9), (0, -1), 0x0ABC, 0x0ACD, {0x0ABF}, {}),
-    "Tamil": ((0x0B95, 0x0BB9), (0, -1), None, 0x0BCD, {0x0BC6, 0x0BC7, 0x0BC8},
+    "Gurmukhi": (((0x0A15, 0x0A39), (0x0A59, 0x0A5E)), 0x0A3C, 0x0A4D, {0x0A3F}, {}),
+    "Gujarati": (((0x0A95, 0x0AB9),), 0x0ABC, 0x0ACD, {0x0ABF}, {}),
+    "Tamil": (((0x0B95, 0x0BB9),), None, 0x0BCD, {0x0BC6, 0x0BC7, 0x0BC8},
               {0x0BCA: (0x0BC6, 0x0BBE), 0x0BCB: (0x0BC7, 0x0BBE), 0x0BCC: (0x0BC6, 0x0BD7)}),
-    "Malayalam": ((0x0D15, 0x0D39), (0, -1), None, 0x0D4D, {0x0D46, 0x0D47, 0x0D48},
+    "Malayalam": (((0x0D15, 0x0D39),), None, 0x0D4D, {0x0D46, 0x0D47, 0x0D48},
                   {0x0D4A: (0x0D46, 0x0D3E), 0x0D4B: (0x0D47, 0x0D3E), 0x0D4C: (0x0D46, 0x0D57)}),
 }
 
@@ -28,10 +29,10 @@ def reorder(text: str, script: str) -> str:
     spec = _SCRIPTS.get(script)
     if spec is None:
         return text
-    (c_lo, c_hi), (x_lo, x_hi), nukta, virama, before, split = spec
+    ranges, nukta, virama, before, split = spec
 
     def consonant(o: int) -> bool:
-        return c_lo <= o <= c_hi or x_lo <= o <= x_hi
+        return any(lo <= o <= hi for lo, hi in ranges)
 
     out: list[str] = []
     i = 0

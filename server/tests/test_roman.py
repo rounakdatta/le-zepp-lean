@@ -120,3 +120,31 @@ def test_word_timings_follow_whichever_text_is_shown_and_urdu_goes_as_whole_line
     urdu = Song(id="u", title="t", artist="a", lyrics_kind="synced", lrc=[[1000, "دل دل پاکستان جان جان"]], script="Arabic",
                 roman=["dil dil pakistan jaan"], words=words)
     assert lyrics_payload(urdu, 0.1, read=["Arabic"])["lines"][0][2] is None
+
+
+def test_letters_for_lyrics_that_changed_meanwhile_are_not_kept_and_the_new_ones_get_theirs(api, monkeypatch):
+    """A refresh brought other lyrics while the gateway was still writing the old ones in English
+    letters: those letters were stored on the new lyrics, and the song said "pending" for good."""
+    client, app_module, _ = api
+    lines = {"now": HINDI}
+
+    async def find(*_a):
+        return Lyrics(kind="synced", lines=lines["now"], source="lrclib", source_id=7)
+
+    async def slow_romanize(_client, texts, title, artist):
+        await asyncio.sleep(0.4)
+        return ["x%d" % i if t else "" for i, t in enumerate(texts)]
+
+    monkeypatch.setattr(app_module._lyrics, "find", find)
+    monkeypatch.setattr(roman, "romanize", slow_romanize)
+    client.post("/identify", json={"audio": watch_file(music(5)), "purpose": "find"})  # lyrics, and their letters on the way
+    song = app_module._store.get("k1")
+    time.sleep(0.1)
+    lines["now"] = HINDI + [(9000, "दिल ना लगाए कोई")]  # LRCLIB answers differently on a refresh
+    song.lyrics_retry_at = time.time() - 1
+    client.post("/lyrics", json={"song": "k1"})
+    time.sleep(1.5)
+    r = client.post("/lyrics", json={"song": "k1"}).json()["lyrics"]
+    assert r["kind"] == "synced", "stuck on pending"
+    assert len(song.roman) == len(song.lrc) == 4
+    assert [line[1] for line in r["lines"]] == ["x0", "", "x2", "x3"]

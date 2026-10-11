@@ -148,3 +148,23 @@ def test_a_lyrics_lookup_that_fails_is_retried_while_the_song_plays(api, monkeyp
         time.sleep(0.05)
     assert kind == "synced", "found on the retry, without anyone asking"
     assert "none" not in seen, "the watch was never told there are no lyrics"
+
+
+def test_a_helper_gone_quiet_is_heard_of_at_once_as_paused_where_it_had_got_to(monkeypatch):
+    """Android killed the helper mid-song: after STALE_S it counts as paused, under a new
+    version, and a long poll waiting for news gets that then. (Only the view used to say so:
+    with no new version the relay passed nothing on, and the watch followed the old song for good.)"""
+    monkeypatch.setattr(phone, "STALE_S", 0.3)
+    p = phone.Phone()
+    p.update(update(), time.time())
+    v = p.now.version
+
+    async def poll():
+        t = time.perf_counter()
+        snap = await p.wait(v, 5.0)
+        return snap, time.perf_counter() - t
+
+    snap, waited = asyncio.run(poll())
+    assert snap.version == v + 1 and not snap.playing
+    assert waited < 1.0, "woken as the helper went quiet, not at the end of the poll"
+    assert abs(snap.position_ms - 10_300) < 30, "paused where the track had got to by then"

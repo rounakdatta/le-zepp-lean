@@ -25,3 +25,11 @@ def test_everything_else_is_left_alone():
     assert reorder("कोई", "Devanagari") == "कोई"
     assert reorder("Tum hi ho", "Devanagari") == "Tum hi ho"
     assert reorder("నాటు", "Telugu") == "నాటు"
+
+
+def test_assamese_letters_take_their_vowel_sign_in_front_too():
+    # ৰ (ra) and ৱ (wa) are Assamese-only consonants: "Bengali, Assamese" in the settings
+    assert reorder("ৰি", "Bengali") == "িৰ"
+    assert reorder("ৱে", "Bengali") == "েৱ"
+    assert reorder("ৰো", "Bengali") == "েৰা"
+    assert reorder("প্ৰি", "Bengali") == "িপ্ৰ"

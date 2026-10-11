@@ -50,8 +50,16 @@ class Phone:
         s = self.now
         return s.position_ms + ((t - s.at) * 1000 * s.speed if s.playing else 0.0)
 
-    def stale(self, t: float) -> bool:
-        return self.now.playing and t - self.now.updated > STALE_S
+    def expire(self, t: float) -> None:
+        """A helper silent for STALE_S while "playing" (killed, or its phone asleep) isn't
+        trusted to be playing: its track is paused where it had got to by then, under a new
+        version, so that the watch hears of it (only the view used to say so, and the watch,
+        seeing no new version, followed the old one for good)."""
+        s = self.now
+        if s.playing and t - s.updated > STALE_S:
+            at = s.updated + STALE_S
+            s.position_ms, s.at, s.playing = self.position(at), at, False
+            self.bump()
 
     def update(self, body: dict, received: float) -> bool:
         """Take an update from the helper. True when it is a different track."""
@@ -90,18 +98,24 @@ class Phone:
         self._changed = asyncio.Event()
 
     async def wait(self, since: int, timeout: float) -> Snapshot:
-        """The state once its version differs from `since`, or after `timeout` whatever it is."""
+        """The state once its version differs from `since`, or after `timeout` whatever it is.
+        A helper going quiet is a change too: the wait ends the moment it counts as gone."""
+        self.expire(now())
         if self.now.version != since:
             return self.now
+        if self.now.playing:
+            timeout = min(timeout, max(0.0, self.now.updated + STALE_S - now()) + 0.01)
         changed = self._changed
         try:
             await asyncio.wait_for(changed.wait(), timeout)
         except asyncio.TimeoutError:
             pass
+        self.expire(now())
         return self.now
 
     def view(self, t: float) -> dict:
         """What the watch gets: everything, with the position as of `t`."""
+        self.expire(t)
         s = self.now
         return {
             "version": s.version,
@@ -109,7 +123,7 @@ class Phone:
             "title": s.title,
             "artist": s.artist,
             "durationMs": s.duration_ms,
-            "playing": s.playing and not self.stale(t),
+            "playing": s.playing,
             "positionMs": round(self.position(t)),
             "speed": s.speed,
             "songId": s.song_id,

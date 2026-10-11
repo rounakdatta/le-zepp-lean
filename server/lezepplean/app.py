@@ -237,6 +237,11 @@ async def _lookup_lyrics(song: Song, length_ok: bool = True, retry_length: bool 
             song.length_checked = True
     duration_s = song.duration_ms / 1000 if song.duration_ms and song.length_checked else None
     lyrics = await _lyrics.find(song.title, song.artist, song.album, duration_s)
+    if not lyrics.definite and song.lyrics_kind == "synced":
+        # LRCLIB couldn't be asked: keep the lyrics there are (a refresh during an outage
+        # used to swap them for none, mid-song) and ask again later.
+        song.lyrics_retry_at = time.time() + LYRICS_RETRY_S
+        return
     definite = lyrics.definite and length_ok
     new_lrc = [[ms, " ".join(text.split())] for ms, text in lyrics.lines]  # one space: the watch splits on whitespace runs
     if new_lrc != song.lrc:
@@ -272,15 +277,18 @@ def _romanize_if_due(song: Song) -> None:
         return
     _romanizing.add(song.id)
 
+    lrc = list(song.lrc)
+
     async def run() -> None:
         try:
-            lrc = list(song.lrc)
             for wait in (0,) + ROMAN_RETRY_S:
                 if wait:
                     await asyncio.sleep(wait)
                 if song.lrc != lrc:
-                    return  # the lyrics changed meanwhile: their own turn comes
+                    return  # the lyrics changed meanwhile: their own turn comes (below)
                 out = await roman.romanize(_http, [t for _, t in lrc], song.title, song.artist)
+                if song.lrc != lrc:
+                    return  # ...even during the call: these are the old lines' letters
                 if out is not None:
                     song.roman = out
                     _store.put(song)
@@ -296,6 +304,8 @@ def _romanize_if_due(song: Song) -> None:
             log.exception("romanizing %s failed", song.id)
         finally:
             _romanizing.discard(song.id)
+            if song.lrc != lrc:
+                _romanize_if_due(song)  # the new lines, now that this run is out of the way
 
     asyncio.get_running_loop().create_task(run())
 
@@ -305,8 +315,11 @@ _refreshing: set[str] = set()
 
 def _refresh_lyrics_if_due(song: Song) -> None:
     """Ask LRCLIB again in the background (it can take 25 s when slow: the phone gives up
-    after 9.5). The retry time moves on first, so a second request doesn't start a second lookup."""
-    if not song.lyrics_retry_at or time.time() < song.lyrics_retry_at or song.id in _refreshing:
+    after 9.5). The retry time moves on first, so a second request doesn't start a second lookup.
+    A song still "pending" with no lookup under way is due too: its first one was cut off (the
+    process died), and it used to stay "Loading lyrics…" for good."""
+    due = song.lyrics_retry_at or song.lyrics_kind == "pending"
+    if not due or time.time() < song.lyrics_retry_at or song.id in _refreshing:
         return
     song.lyrics_retry_at = time.time() + LYRICS_RETRY_S
     _store.put(song)
@@ -341,6 +354,7 @@ async def _song_for(match, position_ms: float | None = None) -> Song:
         apple_id=match.apple_id, isrc=match.isrc, shazam_key=match.shazam_key, lyrics_kind="pending",
     )
     _store.put(song)
+    _refreshing.add(song.id)  # the first lookup is one under way (see _refresh_lyrics_if_due)
     lookup = asyncio.get_running_loop().create_task(_first_lyrics(song, position_ms))
     try:
         await asyncio.wait_for(asyncio.shield(lookup), LYRICS_WAIT_S)
@@ -363,6 +377,8 @@ async def _first_lyrics(song: Song, position_ms: float | None) -> None:
         log.exception("lyrics for %s failed", song.id)
         song.lyrics_kind = "none"
         song.lyrics_retry_at = time.time() + LYRICS_RETRY_S
+    finally:
+        _refreshing.discard(song.id)
     _store.put(song)
     if song.lyrics_kind == "synced" and position_ms is not None:
         _preparer.ensure(song, position_ms + (time.monotonic() - asked) * 1000)
@@ -511,24 +527,28 @@ async def _resolve_phone_track(track: tuple, app_id: str, title: str, artist: st
         if _phone.now.track == track:
             _phone.now.song_id = song.id
             _phone.bump()
-        if song.lyrics_kind == "pending":
+        if song.lyrics_kind == "pending" and song.id not in _refreshing:
             # the player's own length: the lyrics are timed for this recording or not at all
-            for wait in (0,) + PHONE_LYRICS_RETRY_S:
-                if wait:
-                    await asyncio.sleep(wait)
-                    if _phone.now.track != track:
-                        break  # another song now: it is looked up the next time it plays
-                await _lookup_lyrics(song, length_ok=bool(duration_ms))
-                if song.lyrics_kind == "synced" or not song.lyrics_retry_at:
-                    break  # found, or LRCLIB answered that it has none
-                song.lyrics_kind = "pending"  # LRCLIB couldn't be asked: still coming, not "none"
-                _store.put(song)
+            _refreshing.add(song.id)
+            try:
+                for wait in (0,) + PHONE_LYRICS_RETRY_S:
+                    if wait:
+                        await asyncio.sleep(wait)
+                        if _phone.now.track != track:
+                            break  # another song now: it is looked up the next time it plays
+                    await _lookup_lyrics(song, length_ok=bool(duration_ms))
+                    if song.lyrics_kind == "synced" or not song.lyrics_retry_at:
+                        break  # found, or LRCLIB answered that it has none
+                    song.lyrics_kind = "pending"  # LRCLIB couldn't be asked: still coming, not "none"
+                    _store.put(song)
+            finally:
+                _refreshing.discard(song.id)
             if song.lyrics_kind == "pending":
                 song.lyrics_kind = "none"
             _store.put(song)
             if _phone.now.track == track:
                 _phone.bump()  # the watch asks for the lyrics when it hears of a change
-        else:
+        elif song.lyrics_kind != "pending":
             _refresh_lyrics_if_due(song)
             _romanize_if_due(song)
         _preparer.ensure(song, _phone.position(time.time()) if _phone.now.track == track else None)

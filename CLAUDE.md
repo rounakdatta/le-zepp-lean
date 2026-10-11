@@ -16,9 +16,9 @@ Platform research, with sources, is in `docs/research/` (start at `docs/research
 | `android/` | The helper for earphones mode: reads the playing media session (Android shows it only to apps with notification access) and posts it to `/phone`. `.github/workflows/android.yml` builds it; a `helper-v*` tag publishes the signed APK as a GitHub release |
 | `server/lezepplean/align/` | Word timing: `text.py` (lyrics → letters), `separate.py` (Spleeter vocals, ONNX), `ctc.py` (wav2vec 2.0 letter probabilities, ONNX int8), `forced.py` (banded CTC forced alignment), `__init__.py` (`align_lyrics`, measured settings) |
 | `server/scripts/` | `fake_watch.py` (send a clip like the phone does), `eval_align.py` / `eval_track.py` (benchmarks), `watch_sim.py` + `sim_stream.py` (what the watch would record), `silk_levels.py` |
-| `tests/watch/` | Node tests for the watch's pure logic |
+| `tests/watch/` | Node tests for the watch's logic, and for the page itself (`page.test.mjs`) |
 | `tests/sim/simulate.mjs` | Replays a simulated listening session through the real session logic against a running server, in simulated time, and measures what the person would see |
-| `tests/render/` | A `@zos/ui` stand-in that records widgets, so `view.js` screens can be drawn (Pillow) and looked at |
+| `tests/render/` | Stand-ins for Zepp OS: `zos-ui.mjs` records widgets, so `view.js` screens can be drawn (Pillow) and looked at; with `zos-stubs.mjs` the page runs under Node |
 | `tools/` | `serve.sh` (server, tunnel and keep-awake), `install-watch.sh` (sign-in, build, install QR), `qr-hook.cjs` |
 | `charts/lezepplean/`, `.github/workflows/docker.yml` | The server's Helm chart and its CI (tests, then image + chart to GHCR), in texas-fold-em's shape |
 | `docs/research/` | Platform research (6 detailed reports plus a summary) |
@@ -105,7 +105,7 @@ watch: lines [start, text, wordStarts|null, end|null]; the current line is one w
 - Requires the undocumented permission `device:os.mic`; without it the recorder throws PERMISSION DENIED.
 - Output is **raw Opus packets in opus_demo framing**: `[4-byte BE length][4-byte final range][packet]`, not Ogg.
 - The encoding is **SILK wideband, 16 kHz mono, 60 ms single-frame packets** (TOC config 11, code 0), ~17 kbps, so about 10 KB per 5 s. libopus reproduces exactly this at 16–20 kbps with `application=voip`, `frame_duration=60` (`server/lezepplean/silk.py`).
-- Capture starts ~0.33–0.35 s after `start()`: 4680 ms is decoded from a ~5010 ms window, and a 2 s take holds 28 packets. So clip timing is anchored on `stop()` (`sync.clipStartMs`).
+- Capture starts ~0.33–0.35 s after `start()`: 4680 ms is decoded from a ~5010 ms window, and a 2 s take holds 28 packets. So a take is timed back from `stop()` by its packet count (page `onTake`).
 - **On the T-Rex 3 the file is handed over only at `stop()`**: nothing can be read while it records (6.4.16.3, 10 Oct 2026). So the app runs on back-to-back takes; `live.js` still probes at runtime and is used where the file grows.
 - **One recorder at a time.** A second `create()` returns undefined until the first is garbage collected, so everything shares one (`recorder.microphone()`).
 - The START and STOP events arrive within ~5 ms on the T-Rex 3. Some firmware lacks them and `getStatus`, so `recorder.js` falls back to watching the file size.
@@ -191,12 +191,12 @@ Blinding Lights in a simulated room calibrated to the watch's real levels (music
 | while playing | lyrics a median 23 ms from the music, within 100 ms 90% of the time |
 | word lit = word being sung | 82% (Blinding Lights), 95% (Wonderwall), 93% (a turntable 1% fast) |
 
-Takes mode, which is what the T-Rex 3 runs (`simulate.mjs --takes`, same song and room: a pause, talking during a pause, resumes; 10 Oct 2026):
+Takes mode, which is what the T-Rex 3 runs (`simulate.mjs --takes`, same song and room: a pause, talking during a pause, resumes; 11 Oct 2026, 0.2.9):
 
 | | |
 |---|---|
-| lyrics frozen at the stop | 99 / 395 / 35 ms off |
-| after resuming | 15–63 ms off |
+| lyrics frozen at the stop | 99 / 157 / 137 ms off |
+| after resuming | 17–63 ms off |
 | within 100 ms of the music | 100% |
 | word lit = word sung | 96% |
 
@@ -221,7 +221,7 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 | ShazamIO; the server on the homelab (`charts/lezepplean`), the Mac only for working on it (`tools/serve.sh`) | The user's choice |
 | Back-to-back takes, 250 ms apart: 5 s while finding the song, 3 s when the take will be sent, 2 s while following | The T-Rex 3 hands over a recording only when it stops, so a take's length is how late a pause or a resume can be noticed. 2 s is the shortest the server can place inside a song (1.56 s couldn't be) |
 | A take is sent only when an answer is needed, and never replaces a request in flight | Replacing it left the watch on "Listening…" while the answers kept arriving for takes already replaced |
-| A resume moves the lyrics only once the sound is shown to be the song where it stopped: first on the watch (the take's loudness against the song's loudness track near the expected position: r ≥ 0.6 over ≥ 23 packets, ≥ 0.7 over 17–22), otherwise by the server | In a simulated room, 1.4 s of the real song correlated ≥ 0.72 nine times in ten and was placed within a packet; talking never passed 0.47 |
+| A resume moves the lyrics only once the sound is shown to be the song where it stopped: first on the watch (the take's loudness against the song's loudness track near the expected position: r ≥ 0.6 over ≥ 23 packets, ≥ 0.7 over 17–22), otherwise by the server. The watch's check never waits for the server, and the question stays open until an answer settles it | In a simulated room, 1.4 s of the real song correlated ≥ 0.72 nine times in ten and was placed within a packet; talking never passed 0.47. Closed when the question was sent, one lost answer left the lyrics frozen while the music played |
 | A pause is dated from the first quiet packet of its stretch, or the middle of the gap between takes | Packets forgiven as noise used to restart the count, and a stop was dated 1.4 s late |
 | Pause/resume decided on the watch from the SILK gain, backdated to the packet | No round trip: the lyrics stop on the right word as soon as the watch has the audio (at the end of the take; ~0.6 s with a continuous recording) |
 | Thresholds measured on real recordings until the room's floor is known, then relative to floor and music | Fixed thresholds failed in a room with a louder floor; relative ones from the start were more sensitive than the real recordings justify |
@@ -245,12 +245,13 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 | Display timing: a line appears 300 ms early, a word lights 40 ms early, timers at exact change times | Reading ahead; drawing time |
 | A new song's name goes out within 1.5 s; its lyrics, if LRCLIB hasn't answered, as "pending", which the watch polls (1.5 s, then ×1.5 up to 10 s) | Lyrics first, words later. A slow LRCLIB used to hold the whole answer, and one failure showed as "no lyrics" for good |
 | Earphones mode: the phone's position, not audio. The server keeps the player's clock (offset = the fastest delivery among the recent updates), the side service long-polls and pushes, and the mic is off; after 60 s paused, the room is listened to again | Exact where the mic is an estimate, and pushed: a change reaches the watch without it asking. The mic would only hear the room |
+| In earphones mode the phone ends its songs, not the watch's clock; a helper silent for 35 s while "playing" is marked paused, under a new version | Ended on the watch's clock, a song left the watch following the phone with nothing to follow and its mic off. A helper Android killed was only paused in the server's view, which nothing passed on |
 | Lyrics in a script the user doesn't read, or the watch can't draw, are written in English letters once per song by an LLM, and their words are timed in those letters | Fans sing from everyday spellings (dil, pyaar), which rule-based transliteration doesn't produce. One call per song costs ~3 s, once |
 | Native script only for the scripts ticked in the settings that the watch can draw, its letters reordered by `visual.py` (Tamil per consonant); Urdu without word timings | The font has the glyphs but doesn't shape them, and one widget per word would set Urdu's right-to-left words out left to right. Telugu, Punjabi, Gujarati and Odia always go out in English letters |
 
 ## Status
 
-**0.2.8 is live** on the homelab and runs on the user's T-Rex 3: takes with resumes checked on the watch, word-by-word karaoke, pauses, resumes, skips and next songs followed, earphones mode with the helper (0.1.1), lyrics in English letters or in the scripts the user reads. Before it reached the watch, four rounds of independent review found 12 bugs (and 6 risks), then 8, 3 and 1 more in the previous round's fixes, that the green suites had missed; a fifth round found nothing. All but one now have a test that failed before its fix; the exception (takes mode anchoring an answer on the wrong take) is in `page/home/index.js`, which Node can't load, and was fixed by reading.
+**0.2.8 is live** on the homelab and runs on the user's T-Rex 3: takes with resumes checked on the watch, word-by-word karaoke, pauses, resumes, skips and next songs followed, earphones mode with the helper (0.1.1), lyrics in English letters or in the scripts the user reads. Before it reached the watch, four rounds of independent review found 12 bugs (and 6 risks), then 8, 3 and 1 more in the previous round's fixes, that the green suites had missed; a fifth round found nothing. All but one now have a test that failed before its fix; the exception (takes mode anchoring an answer on the wrong take) is in `page/home/index.js`, which Node couldn't load then, and was fixed by reading. A sixth review, of the code that took it onto the real watch (0.2.3–0.2.8), found 15 more: four could leave the watch frozen, stuck on "Loading lyrics…" or deaf until restarted. 0.2.9 fixes them, each with a test that failed before its fix (the page runs under Node now) except two found by reading: a resume heard partway through a take anchored to the take's start (the page re-anchored windows the session had already timed), and plain-http servers refused by the helper.
 
 **Open:**
 1. Finding takes of 3.5 s instead of 5 s: on room clips cut 3–4.7 s long, Shazam named the song 60–70% of the time at every length.
@@ -260,7 +261,7 @@ These scenarios are `play/silence/talk/next` scripts for `server/scripts/sim_str
 
 ## Conventions
 
-- **Watch tests** live in `tests/` (Node, ESM, no Zepp APIs); keep logic pure so it can be tested there. `session.js` takes time as an argument for the same reason.
+- **Watch tests** live in `tests/` (Node, ESM, no Zepp APIs); keep logic pure so it can be tested there. The page itself runs under Node with the stand-ins in `tests/render` (`tests/watch/page.test.mjs`): test what the page does there. `session.js` takes time as an argument for the same reason.
 - **Server tests** are in `server/tests/`, run with `uv run pytest`. Nothing in them touches the network.
 - **Commits** never include `server/.token`, `server/captures/`, `server/data/`, `server/models/`, caches or build output; they are git-ignored.
 - **Research before building.** Check the minimum API_LEVEL of any Zepp OS API before using it. The docs source is `github.com/zepp-health/zeppos-docs`; clone and grep it. Community answers are at `github.com/orgs/zepp-health/discussions`.

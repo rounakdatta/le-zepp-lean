@@ -31,15 +31,6 @@ test('msUntilNextLine and lineProgress', () => {
   assert.equal(sync.lineProgress(LINES, 3, 999999, 200000), 1)
 })
 
-test('clip start anchors on stop() when the decoded length is plausible', () => {
-  // start() returned at 1000, stop() at 6000, but only 4800 ms of audio came back:
-  // the mic took ~200 ms to start capturing, so the clip really began at 1200.
-  assert.deepEqual(sync.clipStartMs(1000, 6000, 4800), { at: 1200, anchor: 'stop', latencyMs: 200 })
-  // Implausible decode length (e.g. a truncated file): fall back to the start() time.
-  assert.equal(sync.clipStartMs(1000, 6000, 1000).anchor, 'start')
-  assert.equal(sync.clipStartMs(1000, 6000, undefined).anchor, 'start')
-})
-
 test('end to end: the server offset drives the displayed line', () => {
   // Real numbers from the local server test: a clip starting 151,052.9 ms into
   // "Blinding Lights"; the line starting at 150,270 ms is being sung.

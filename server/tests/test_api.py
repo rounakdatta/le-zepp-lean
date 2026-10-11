@@ -265,3 +265,61 @@ def test_the_address_in_a_browser_shows_what_this_is_and_nothing_else(api):
     assert client.get("/favicon.ico").headers["content-type"] == "image/png"
     assert client.get("/docs").status_code == 404 and client.get("/openapi.json").status_code == 404
     assert client.get("/recent").status_code in (200, 401)  # unchanged: the API is the API
+
+
+def test_a_lookup_cut_off_by_a_restart_is_made_again(api, monkeypatch):
+    """A new song is saved before its lyrics are looked up. Should the process die meanwhile
+    (an OOM, a deploy), it was left "pending" for good: "Loading lyrics…" forever, in a 10 s poll."""
+    import time
+
+    from lezepplean.songs import Song
+
+    client, app_module, _ = api
+    asked = {"n": 0}
+
+    async def find(*_a):
+        asked["n"] += 1
+        return Lyrics(kind="synced", lines=[(1000, "Hello world")], source="lrclib", source_id=7)
+
+    monkeypatch.setattr(app_module._lyrics, "find", find)
+    # what the dead process left behind: the song, and no lookup running for it
+    app_module._store.put(Song(id="k1", title="Song", artist="Band", apple_id="1", shazam_key="k1", lyrics_kind="pending"))
+    client.post("/lyrics", json={"song": "k1"})
+    for _ in range(100):
+        if app_module._store.get("k1").lyrics_kind == "synced":
+            break
+        time.sleep(0.02)
+    assert asked["n"] == 1
+    assert client.post("/lyrics", json={"song": "k1"}).json()["lyrics"]["kind"] == "synced"
+
+
+def test_a_refresh_while_lrclib_is_down_keeps_the_lyrics_there_are(api, monkeypatch):
+    import time
+
+    client, app_module, _ = api
+
+    async def itunes(_id):
+        return 60.0, True
+
+    monkeypatch.setattr(app_module._lyrics, "itunes_lookup", itunes)
+    client.post("/identify", json={"audio": watch_file(music(5)), "purpose": "find"})
+    asked = {"n": 0}
+
+    async def down(*_a):
+        asked["n"] += 1
+        return Lyrics(kind="none", definite=False)
+
+    monkeypatch.setattr(app_module._lyrics, "find", down)
+    song = app_module._store.get("k1")
+    assert song.lyrics_kind == "synced"
+    song.lyrics_retry_at = 1.0  # a refresh is due (lyrics picked without the track's length, say)
+    client.post("/lyrics", json={"song": "k1"})
+    for _ in range(100):
+        if asked["n"]:
+            break
+        time.sleep(0.02)
+    time.sleep(0.05)
+    assert asked["n"] == 1
+    r = client.post("/lyrics", json={"song": "k1"}).json()
+    assert r["lyrics"]["kind"] == "synced", "an outage swapped the lyrics for none, mid-song"
+    assert app_module._store.get("k1").lyrics_retry_at > time.time() + 60, "and LRCLIB is asked again later"
