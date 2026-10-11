@@ -17,6 +17,17 @@ function config() {
   return { url, token }
 }
 
+// The scripts the person reads (the settings page's toggles): their songs come in their own
+// script; everything else in English letters.
+function readScripts() {
+  const out = []
+  ;['Devanagari', 'Bengali', 'Tamil', 'Malayalam', 'Kannada', 'Arabic'].forEach((s) => {
+    const v = settingsLib.getItem('read_' + s)
+    if (v === true || v === 'true') out.push(s)
+  })
+  return out
+}
+
 function headers(token, json) {
   const h = {}
   if (json) h['Content-Type'] = 'application/json'
@@ -67,13 +78,14 @@ function identify(params) {
     song: params.song || null,
     expectMs: params.expectMs === undefined ? null : params.expectMs,
     known: params.known || null,
+    read: readScripts(),
     client: params.diag,
   })
 }
 
 // No audio: word timings (and the loudness track) for a song, if they have changed.
 function lyrics(params) {
-  return post('/lyrics', { song: params.song, known: params.known || null })
+  return post('/lyrics', { song: params.song, known: params.known || null, read: readScripts() })
 }
 
 // ---- what the phone is playing ----------------------------------------------------

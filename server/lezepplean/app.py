@@ -116,6 +116,7 @@ class IdentifyRequest(BaseModel):
     song: str | None = None
     expectMs: float | None = None
     known: dict | None = None
+    read: list[str] | None = None  # scripts the person reads: their songs in their own script
 
 
 class PhoneUpdate(BaseModel):
@@ -134,6 +135,7 @@ class PhoneUpdate(BaseModel):
 class LyricsRequest(BaseModel):
     song: str
     known: dict | None = None
+    read: list[str] | None = None  # scripts the person reads: their songs in their own script
 
 
 def _check_token(authorization: str | None) -> None:
@@ -172,11 +174,12 @@ def _song_info(song: Song) -> dict:
     return {"id": song.id, "title": song.title, "artist": song.artist, "album": song.album, "durationMs": song.duration_ms}
 
 
-def _song_data(song: Song, known: dict | None) -> dict:
-    """Lyrics and loudness track unless the watch has these versions, plus the words status."""
+def _song_data(song: Song, known: dict | None, read: list[str] | None = None) -> dict:
+    """Lyrics and loudness track unless the watch has these versions, plus the words status.
+    `read`: the scripts the person reads (the Zepp app's settings), for songs in other scripts."""
     known = known or {}
     out: dict = {}
-    payload = lyrics_payload(song, MIN_LINE_CONFIDENCE)
+    payload = lyrics_payload(song, MIN_LINE_CONFIDENCE, read)
     if known.get("lyrics") != payload["version"]:
         out["lyrics"] = payload
     if song.envelope and known.get("envelope") != song.envelope.get("version"):
@@ -407,7 +410,7 @@ async def lyrics(req: LyricsRequest, authorization: str | None = Header(None)) -
     _refresh_lyrics_if_due(song)
     _romanize_if_due(song)
     _preparer.ensure(song, None)
-    return {"ok": True, "song": _song_info(song), **_song_data(song, req.known)}
+    return {"ok": True, "song": _song_info(song), **_song_data(song, req.known, req.read)}
 
 
 @app.post("/phone")
@@ -551,7 +554,7 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
         _preparer.ensure(song, match["offsetMs"] + (clip.duration_ms or 0) + 3000)
         known = req.known if req.known is not None and song.id == req.song else None
         info = _song_info(song)
-        response.update(ok=True, song=info, track=info, match=match, **_song_data(song, known))
+        response.update(ok=True, song=info, track=info, match=match, **_song_data(song, known, req.read))
         return response
     finally:
         timing["totalMs"] = round((time.perf_counter() - started) * 1000)

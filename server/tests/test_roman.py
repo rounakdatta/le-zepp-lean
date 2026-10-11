@@ -94,3 +94,29 @@ def test_without_its_romanization_a_hindi_song_is_not_aligned_at_all(tmp_path):
     p._plan(song, 10_000)
     assert not p._queue, "an aligner of English letters can't read Devanagari: wait for the romanization"
     assert lyrics_payload(song, 0.1)["kind"] == "pending"
+
+
+def test_a_language_the_person_reads_comes_in_its_own_script_reordered_for_the_watch():
+    song = Song(id="s", title="Kesariya", artist="Arijit Singh", lyrics_kind="synced", lrc=[list(x) for x in HINDI], script="Devanagari")
+    p = lyrics_payload(song, 0.1, read=["Devanagari"])
+    assert p["kind"] == "synced", "no wait for a romanization they don't need"
+    assert p["lines"][2][1] == "कैसे तुझसे िदल ना लगाए कोई", "दिल with its i-sign first: the watch draws letters where they come"
+    assert lyrics_payload(song, 0.1, read=["Bengali"])["kind"] == "pending", "not one they read: English letters, once they exist"
+
+
+def test_a_script_the_watch_has_no_letters_for_is_always_in_english_letters():
+    telugu = [(1000, "ఏ నాటు నాటు సరుకేరో")]
+    song = Song(id="s", title="Naatu Naatu", artist="Rahul Sipligunj", lyrics_kind="synced", lrc=[list(x) for x in telugu],
+                script="Telugu", roman=["Ye naatu naatu sarukero"])
+    assert lyrics_payload(song, 0.1, read=["Telugu"])["lines"][0][1] == "Ye naatu naatu sarukero"
+
+
+def test_word_timings_follow_whichever_text_is_shown_and_urdu_goes_as_whole_lines():
+    words = {"lines": {"0": [1000, [1000, 1400, 1800, 2200], 3000, 0.9]}}
+    hindi = Song(id="s", title="t", artist="a", lyrics_kind="synced", lrc=[[1000, "मुझको इतना बताए कोई"]], script="Devanagari",
+                 roman=["mujhko itna bataye koi"], words=words)
+    assert lyrics_payload(hindi, 0.1)["lines"][0][2] == [1000, 1400, 1800, 2200], "lit word by word in English letters"
+    assert lyrics_payload(hindi, 0.1, read=["Devanagari"])["lines"][0][2] == [1000, 1400, 1800, 2200], "and in Devanagari: same words"
+    urdu = Song(id="u", title="t", artist="a", lyrics_kind="synced", lrc=[[1000, "دل دل پاکستان جان جان"]], script="Arabic",
+                roman=["dil dil pakistan jaan"], words=words)
+    assert lyrics_payload(urdu, 0.1, read=["Arabic"])["lines"][0][2] is None
