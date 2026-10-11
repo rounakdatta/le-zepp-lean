@@ -62,6 +62,10 @@ const LYRICS_PENDING_POLL_MAX_MS = 10000
 // Phone mode: paused this long, the phone is no longer what plays here; the room is listened
 // to again (and the phone takes over the moment it plays).
 const PHONE_IDLE_MS = 60000
+// A phone that has gone quiet (no word from its helper: held back while the screen is off, or
+// killed) is followed on as it was, but not for ever: past its song's end, or this long since
+// it last spoke (a live stream, a long mix, a stalled one have no end to wait for).
+const PHONE_SILENT_MAX_MS = 300000
 const PHONE_SEEK_MS = 1000
 const END_GRACE_MS = 2500
 const END_ZONE_MS = 5000 // music stopping this close to the end is the song ending, not a pause
@@ -323,9 +327,10 @@ export function onTick(s, now) {
   // nothing to follow and the mic off. Unless the phone has gone quiet (its helper held back
   // while the screen is off, or killed): its music is taken to play on, and if the song ends
   // with no word from it, it is let go and the room listened to.
-  if (s.source === 'phone' && s.phone && s.phone.stale && s.song && s.song.durationMs && clock.isKnown(s.clock) &&
-    !clock.isPaused(s.clock) && clock.songAt(s.clock, now) > s.song.durationMs + END_GRACE_MS) {
-    leavePhone(s)
+  if (s.source === 'phone' && s.phone && s.phone.stale) {
+    const ended = s.song && s.song.durationMs && clock.isKnown(s.clock) && !clock.isPaused(s.clock) &&
+      clock.songAt(s.clock, now) > s.song.durationMs + END_GRACE_MS
+    if (ended || now - s.phone.spokeAt > PHONE_SILENT_MAX_MS) leavePhone(s)
   }
   if (s.source !== 'phone' && s.song && clock.isKnown(s.clock) && !clock.isPaused(s.clock) && s.song.durationMs) {
     const pos = clock.songAt(s.clock, now)
@@ -599,8 +604,11 @@ function followPlayer(s, view, now) {
   const prev = s.phone
   const active = view.active !== undefined ? !!view.active : !!view.playing // buffering is still its music
   const pausedSince = active ? null : prev && prev.track === track && prev.pausedSince !== null ? prev.pausedSince : now
-  s.phone = { version: view.version, title: view.title, track, playing: !!view.playing, active, pausedSince, stale: !!view.stale }
-  const follow = !!track && (active || (s.source === 'phone' && now - pausedSince < PHONE_IDLE_MS))
+  const spokeAt = typeof view.ageMs === 'number' ? now - view.ageMs : now
+  s.phone = { version: view.version, title: view.title, track, playing: !!view.playing, active, pausedSince, stale: !!view.stale, spokeAt }
+  // a phone gone quiet is followed on, never newly taken up (once let go, a later word about
+  // its song, still with no word from it, took it up again)
+  const follow = !!track && ((active && (!view.stale || s.source === 'phone')) || (s.source === 'phone' && now - pausedSince < PHONE_IDLE_MS))
   if (!follow) {
     if (s.source === 'phone') leavePhone(s)
     return false
