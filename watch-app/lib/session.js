@@ -61,6 +61,10 @@ const SUSPECT_MS = 20000
 // rather than count towards ending the song (its own pauses still count: the phone's mic is
 // asked now and then, the watch's listens all the time).
 const VOUCH_MS = 30000
+// ...and in its last stretch, a miss asks the phone again, so that its word renews the vouch
+// before it runs out (a phone needing 7.5 s to answer otherwise let three misses end the song
+// every ~42 s in a room the watch can't place; 15 s was 0.6 s short).
+const VOUCH_RENEW_MS = 20000
 // News from the phone's mic is about audio that began this long before it says (its clock and
 // the watch's agree to well under a second): about the music after a stop only if it began
 // this long after it.
@@ -668,16 +672,18 @@ function onHeard(s, h, now) {
   const asked = suspecting(s, now)
   if (asked && !looking(s) && s.song.id === h.songId) {
     // Asked because the watch couldn't place what plays, and from audio no older than that:
-    // it is still this song. For a while the watch's misses don't count (they slow down).
-    // Where the song is, it says only from audio that began after the music last stopped or
-    // came back: from before, it ran the lyrics on through a pause.
+    // it is still this song. For a while the watch's misses don't count (they slow down), and
+    // it says where the song is.
+    // Nor from before the music last stopped or came back: that is about other music (it ran
+    // the lyrics on through a pause, and vouching on it ended the suspicion, so a new song
+    // named next was ignored).
+    const paused = clock.isPaused(s.clock)
     if (heardFrom === null || heardFrom < s.suspectFrom) return
+    if (heardFrom < (paused ? s.clock.pausedAt : s.clock.lastPauseEnd) + HEARD_MARGIN_MS) return
     s.check = null
     s.misses = 0
     s.suspectAt = -Infinity
     s.vouchedUntil = now + VOUCH_MS
-    const paused = clock.isPaused(s.clock)
-    if (heardFrom === null || heardFrom < (paused ? s.clock.pausedAt : s.clock.lastPauseEnd) + HEARD_MARGIN_MS) return
     if (paused) {
       if (!s.act.playing) return // and the room is quiet: stopped again since
       clock.resume(s.clock, now)
@@ -1058,6 +1064,7 @@ function onMiss(s, req, res, now) {
     // down meanwhile (each is a Shazam call when the song's audio can't place it). A switch to
     // a song Shazam knows is still named by them.
     s.nextVerifyAt = now + 15000
+    if (s.vouchedUntil - now < VOUCH_RENEW_MS) suspect(s, now, req.startAt)
     return
   }
   // Most often the music moved on to another song: look again with the very next take, long

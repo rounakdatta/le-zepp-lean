@@ -1452,3 +1452,36 @@ test('a suspicion that runs on keeps the earliest audio the watch could not plac
   session.onPhone(s, { version: 5, title: '', playing: false, heard: heard({ id: 'r9', positionMs: 60_000, startedAgoMs: 5000 }) }, 37_500)
   assert.ok(!clock.isPaused(s.clock), 'its news counts: the same song, playing')
 })
+
+test('news about the song from before the music stopped neither vouches for it nor ends the suspicion, so the next song can be named', () => {
+  const s = following()
+  s.mode = 'takes'
+  s.nextVerifyAt = 0
+  const sync = take(s, 300, 344, () => LOUD, 300 * MS, 345 * MS) // audio from 18 s
+  session.onResponse(s, sync, { ok: false, reason: 'no_match' }, 346 * MS)
+  take(s, 350, 377, () => QUIET, 350 * MS, 378 * MS) // the music stops
+  assert.ok(clock.isPaused(s.clock))
+  // the phone's news about this song, from audio that began at 20 s: after the take that missed, before the stop
+  session.onPhone(s, { version: 5, title: '', playing: false, heard: heard({ id: 'r9', positionMs: 26_000, startedAgoMs: 380 * MS - 20_000 }) }, 380 * MS)
+  assert.ok(session.suspecting(s, 380 * MS), 'still asking the phone')
+  assert.ok(!(s.vouchedUntil > 380 * MS), 'not vouched for')
+  // then fresh news naming another song, which came in after the stop
+  session.onPhone(s, { version: 6, title: '', playing: false, heard: heard({ id: 'r10', songId: 'champagne', title: 'Champagne Supernova', positionMs: 5000, startedAgoMs: 2000 }) }, 400 * MS)
+  assert.equal(s.song.id, 'champagne')
+})
+
+test("near the end of a vouch, a miss asks the phone again, so that its word renews the vouch in time", () => {
+  const s = following()
+  s.mode = 'takes'
+  s.nextVerifyAt = 0
+  const sync = take(s, 300, 344, () => LOUD, 300 * MS, 345 * MS)
+  session.onResponse(s, sync, { ok: false, reason: 'no_match' }, 346 * MS)
+  session.onPhone(s, { version: 5, title: '', playing: false, heard: heard({ id: 'r9', positionMs: 26_400, startedAgoMs: 2500 }) }, 352 * MS) // vouched until ~51 s
+  session.takeEvents(s)
+  const early = { id: 991, kind: 'identify', purpose: 'sync', song: 'wonderwall', startAt: 22_000, from: 0, to: 49 }
+  session.onResponse(s, early, { ok: false, reason: 'no_match' }, 23_000)
+  assert.ok(!session.takeEvents(s).some((e) => e.type === 'ears'), 'early on: not asked (Shazam calls)')
+  const late = { id: 992, kind: 'identify', purpose: 'sync', song: 'wonderwall', startAt: 38_000, from: 0, to: 49 }
+  session.onResponse(s, late, { ok: false, reason: 'no_match' }, 39_000)
+  assert.ok(session.takeEvents(s).some((e) => e.type === 'ears'), 'in its last 20 s: asked again')
+})
