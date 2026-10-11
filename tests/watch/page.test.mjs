@@ -7,7 +7,20 @@ import { register } from 'node:module'
 register('../render/hooks.mjs', import.meta.url)
 const ui = await import('../render/zos-ui.mjs')
 const { errors } = await import('../render/zos-utils.mjs')
-const { mic } = await import('../render/zos-stubs.mjs')
+const { mic, ble, files } = await import('../render/zos-stubs.mjs')
+const { readFileSync } = await import('node:fs')
+
+// A take of real watch packets (tests/fixtures), all as loud as music: what the recorder hands over.
+const FIXTURE = JSON.parse(readFileSync(new URL('../fixtures/silk-packets.json', import.meta.url)))
+function loudTake(n) {
+  const p = Buffer.from(FIXTURE.packets[40], 'base64')
+  const out = Buffer.alloc(n * (8 + p.length))
+  for (let i = 0; i < n; i++) {
+    out.writeUInt32BE(p.length, i * (8 + p.length))
+    p.copy(out, i * (8 + p.length) + 8)
+  }
+  return out.buffer.slice(out.byteOffset, out.byteOffset + out.length)
+}
 
 const SONG = { title: 'Wonderwall', artist: 'Oasis', durationMs: 258_000, speed: 1, songId: 'wonderwall' }
 const SYNCED = { ok: true, song: { id: 'wonderwall' }, lyrics: { version: 'v1', kind: 'synced', lines: [[500, 'Today is gonna be the day', null, null]] }, words: { status: 'ready' } }
@@ -67,7 +80,26 @@ test('a song on the phone whose lyrics turn out not to exist says so, instead of
   assert.ok(page.screen().includes('No synced lyrics for this song'))
 })
 
-test('a minute paused on the phone, the mic comes back on by itself, with no word from the phone', async (t) => {
+test('the phone paused: the mics listen at once, the paused song stays up, and playing again stops them', async (t) => {
+  let now = { version: -1, title: '' } // what the relay knows: the last state it passed on
+  const page = await openPage(t, (method) => (method === 'lyrics' ? Promise.resolve(SYNCED) : Promise.resolve(now)))
+  const phone = (v) => page.onCall({ method: 'phone', params: (now = { ...SONG, ...v }) })
+  phone({ version: 4, playing: true, positionMs: 1000 })
+  await run(6000)
+  assert.equal(mic.on, false, 'the phone plays: it is the clock, no mic')
+  const starts = mic.starts
+  phone({ version: 5, playing: false, positionMs: 7000 })
+  await run(1000)
+  assert.ok(mic.starts > starts, 'paused: the mics look for a song at once')
+  assert.ok(!page.screen().includes('Listening…'), 'and the paused song stays up meanwhile')
+  phone({ version: 6, playing: true, positionMs: 7000 })
+  await run(12_000) // the take under way finishes
+  const later = mic.starts
+  await run(12_000)
+  assert.equal(mic.starts, later, 'playing again: the mics stop')
+})
+
+test('a minute paused, with no word from the phone, the paused song gives way to listening', async (t) => {
   let reachable = true
   const page = await openPage(t, (method) =>
     method === 'lyrics' ? Promise.resolve(SYNCED) : reachable ? phoneIdle() : Promise.reject({ code: 2 }),
@@ -76,12 +108,10 @@ test('a minute paused on the phone, the mic comes back on by itself, with no wor
   await settle()
   page.onCall({ method: 'phone', params: { ...SONG, version: 5, playing: false, positionMs: 3000 } })
   await settle()
-  const starts = mic.starts
-  assert.equal(mic.on, false, 'the mic is off while the phone is the clock')
   reachable = false // and the phone's link drops: nothing more comes from it
   await run(75_000)
-  assert.ok(mic.starts > starts, 'listening to the room again')
-  assert.ok(page.screen().includes('Listening…'))
+  assert.ok(page.screen().includes('Listening…'), page.screen().join(' | '))
+  assert.ok(mic.starts >= 2, 'listening to the room all along')
 })
 
 test('leaving earphones mode never starts the mic over a take still recording', async (t) => {
@@ -107,4 +137,47 @@ test('the phone taking over and letting go while the opening probe winds down ne
   await run(12_000)
   assert.equal(mic.overlaps, 0, 'the one recorder was never started twice')
   assert.ok(mic.on || mic.starts >= 3, 'and listening carries on')
+})
+
+test('opened with the phone out of reach, the watch says so, and asks the phone the moment the link is back', async (t) => {
+  const asked = []
+  const page = await openPage(t, (method) => {
+    asked.push(method)
+    return method === 'lyrics' ? Promise.resolve(SYNCED) : phoneIdle()
+  })
+  ble.up = false
+  t.after(() => {
+    ble.up = true
+  })
+  await run(1000)
+  assert.ok(page.screen().includes('Waiting for your phone'), page.screen().join(' | '))
+  const before = asked.filter((m) => m === 'phone').length
+  ble.up = true
+  await run(300)
+  assert.ok(asked.filter((m) => m === 'phone').length > before, 'the phone is asked at once, not at the next 20 s turn')
+  assert.ok(!page.screen().includes('Waiting for your phone'))
+})
+
+test('the phone paused in a loud room: its song stays up while the mics look, through a miss', async (t) => {
+  let now = { version: -1, title: '' }
+  const asked = []
+  const page = await openPage(t, (method, params) => {
+    asked.push(method + (params && params.purpose ? ':' + params.purpose : ''))
+    if (method === 'lyrics') return Promise.resolve(SYNCED)
+    if (method === 'identify') return Promise.resolve({ ok: false, reason: 'no_match' })
+    return Promise.resolve(now)
+  })
+  t.after(() => {
+    files.take = null
+  })
+  const phone = (v) => page.onCall({ method: 'phone', params: (now = { ...SONG, ...v }) })
+  phone({ version: 4, playing: true, positionMs: 1000 })
+  await run(3000)
+  files.take = loudTake(55)
+  phone({ version: 5, playing: false, positionMs: 4000 })
+  await run(12_000)
+  assert.ok(asked.includes('identify:find'), 'the mics looked: ' + asked.join(', '))
+  const screen = page.screen().join(' | ')
+  assert.ok(!/Identifying|Listening/.test(screen), screen)
+  assert.ok(/Wonderwall|Today is gonna be the day/.test(screen), screen)
 })

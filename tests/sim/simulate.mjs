@@ -124,7 +124,7 @@ function drain(now) {
 const total = packets.length
 // Takes mode: what page/home/index.js does with each finished take.
 function takeMs(now) {
-  if (!s.song || !s.song.fast || s.doubt) return 5000
+  if (session.looking(s) || !s.song.fast || s.doubt) return 3500
   return session.wantsAudio(s, now) ? 3000 : 2000
 }
 let takes = 0

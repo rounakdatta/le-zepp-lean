@@ -6,7 +6,11 @@ Time-synced lyrics, word by word, on an Amazfit T-Rex 3 (Zepp OS 6): for the mus
 
 Hold the watch near the music. It identifies the song and lights each word as it is sung. Stop the music and the lyrics stop on that word; start it again and they carry on. Skip ahead, or let the next song start, and the watch follows.
 
-**Earphones.** The watch can't hear them, so a small Android app, the [helper](android), tells the server what the phone's player is playing and where it is: Spotify, YouTube Music, YouTube, any player. The watch then follows the player with its mic off, through pauses, seeks and the next track.
+**Earphones.** The watch can't hear them, so a small Android app, the [helper](android), tells the server what the phone's player is playing and where it is: Spotify, YouTube Music, YouTube, any player. The watch then follows the player with its mic off, through pauses, seeks and the next track. Music playing on your phone always comes first.
+
+**Two mics.** When your phone isn't playing anything, the room is listened to: by the watch, and, if you switch it on in the helper, by the phone as well. The phone's mic is far better than the watch's, and not on a moving wrist (a gym, say). Whichever names the song first wins. Pause the phone and both start listening at once, with your song still on screen until something else plays.
+
+**No restarts.** Bluetooth or the network dropping out doesn't stop anything: the watch carries on with what it has, and picks up the moment the link is back.
 
 **Any language.** A song in a script you read shows in it: pick yours (Hindi, Bengali, Tamil, Malayalam, Kannada, Urdu) in the Zepp app. Everything else shows in English letters, the way fans type them (*tujhe dekha toh*), so you can still sing along.
 
@@ -47,6 +51,7 @@ The server runs on the homelab at **https://lezepplean.taptappers.club** (image 
 2. **A server on this Mac instead** (for working on the server): run `tools/serve.sh` in its own terminal window and leave it open. It starts the server and a public HTTPS tunnel, prints the Mac's Wi-Fi address, and keeps the Mac awake; Ctrl-C stops everything. The first run downloads two models (~170 MB), and word timing needs Node or Deno installed (yt-dlp uses it to read YouTube). Re-run `tools/install-watch.sh` whenever the tunnel restarts, because its URL changes each time.
 3. **Settings** are optional. A server URL or token entered in the Zepp app (your watch → LeZeppLean) overrides the built-in ones. **Test connection** checks whichever server is in use. Under **Lyrics in other languages**, turn on the scripts you read.
 4. **Earphones** (optional): on the Android phone, install the APK from the [latest helper release](https://github.com/rounakdatta/le-zepp-lean/releases/latest). Tap **Allow** (Android shows what players play only to apps with notification access), paste the token, then **Save and test**. A newer release installs over the old one and keeps the settings.
+5. **The phone listening too** (optional): in the helper, under **Listen with this phone too**, tap **Turn on** and allow the microphone. Android then shows a small notification while it's ready. For it to answer with the screen off, set Settings → Apps → LeZeppLean → Battery → **Unrestricted** (on vivo, also allow background activity). After a reboot, open the helper once.
 
 **On the watch:**
 

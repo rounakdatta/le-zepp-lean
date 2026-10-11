@@ -5,6 +5,7 @@
 // exactly, with no mic at all.
 import { BaseSideService, settingsLib } from '@zeppos/zml/base-side'
 import { DEFAULT_SERVER_URL, DEFAULT_TOKEN } from './defaults'
+import { listenAuthorization } from './sign'
 
 // The phone's HTTP client is reported to drop requests after ~10 s of silence, so answer
 // well before that; the server itself gives the recognizer at most 6 s.
@@ -99,12 +100,36 @@ let phone = { version: -1, view: null, at: 0 }
 let polling = false
 let lastWatchAt = 0
 
-// The phone's state as of now: the position moves on while it plays.
+// The phone's state as of now: the position moves on while it plays, and so does that of a
+// song its mic named.
 function phoneNow() {
   const v = phone.view
   if (!v) return { version: -1, title: '' }
-  const ran = v.playing ? (Date.now() - phone.at + SERVER_TO_PHONE_MS) * (v.speed || 1) : 0
-  return Object.assign({}, v, { positionMs: Math.round(v.positionMs + ran), sentAt: Date.now() })
+  const since = Date.now() - phone.at + SERVER_TO_PHONE_MS
+  const out = Object.assign({}, v, { positionMs: Math.round(v.positionMs + (v.playing ? since * (v.speed || 1) : 0)), sentAt: Date.now() })
+  if (v.heard && typeof v.heard.positionMs === 'number') out.heard = Object.assign({}, v.heard, { positionMs: Math.round(v.heard.positionMs + since) })
+  return out
+}
+
+// The watch is looking for a song: the LeZeppLean helper on this phone listens too (its mic
+// is better than the watch's), if it is set up to. Asked on the phone itself, so it costs
+// nothing when it isn't; at most every 30 s while the watch keeps looking. The request is
+// signed with the token, never carries it: whatever holds that port is told nothing.
+const HELPER_URL = 'http://127.0.0.1:47391/listen'
+const LISTEN_EVERY_MS = 30000
+let listenedAt = 0
+
+function listenOnPhone() {
+  if (Date.now() - listenedAt < LISTEN_EVERY_MS) return
+  listenedAt = Date.now()
+  const { token } = config()
+  if (!token) return // nothing to sign with: the helper wouldn't listen anyway
+  const now = Date.now()
+  const h = { 'Content-Type': 'application/json', Authorization: listenAuthorization(token, now) }
+  // its answer is only logged: the watch's own search goes on either way
+  fetch({ url: HELPER_URL, method: 'POST', headers: h, body: '{}', timeout: 1500 })
+    .then((res) => console.log('lezepplean: phone mic asked, helper answered ' + res.status))
+    .catch((e) => console.log('lezepplean: phone mic not reached: ' + ((e && e.message) || e)))
 }
 
 // Ask the server for changes (it holds the question up to 8 s), and pass each one to the
@@ -156,6 +181,7 @@ AppSideService(
     onRequest(req, res) {
       if (req.method === 'phone') {
         lastWatchAt = Date.now()
+        if (req.params && req.params.listen) listenOnPhone()
         followPhone(this)
         res(null, phoneNow())
         return

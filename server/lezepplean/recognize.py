@@ -28,14 +28,22 @@ log = logging.getLogger("lezepplean.recognize")
 # 11 Oct 2026 a burst of ~100 calls got the homelab's address rate-limited, and every
 # song search the watch then made (several requests each) kept the limit going.
 COOL_S = (30, 60, 120, 300, 600)
+# And never more than this many calls in a burst, refilled at one per REFILL_S (15 a minute):
+# a song search costs 1-3 calls, a new song's reference check 5. Background work waits for
+# its turn (wait=True); a search that can't wait is told how long (RecognizerBusy).
+BURST = 12
+REFILL_S = 4.0
 
 
 class RecognizerBusy(Exception):
-    """Shazam is refusing calls for now: try again in `retry_in` seconds."""
+    """No call now: Shazam is refusing them (`refused`), or this server's budget of calls is
+    spent for a moment. Try again in `retry_in` seconds."""
 
-    def __init__(self, retry_in: float):
-        super().__init__(f"Shazam is refusing calls; again in {retry_in:.0f} s")
+    def __init__(self, retry_in: float, refused: bool = True):
+        what = "Shazam is refusing calls" if refused else "the budget of Shazam calls is spent"
+        super().__init__(f"{what}; again in {retry_in:.0f} s")
         self.retry_in = retry_in
+        self.refused = refused
 
 
 class _Refused(Exception):
@@ -58,9 +66,11 @@ class _Http(HTTPClientInterface):
         if self._session is None or self._loop is not loop or self._session.closed:
             self._session, self._loop = aiohttp.ClientSession(), loop
         async with self._session.request(method, url, **kwargs) as resp:
-            if resp.status == 429 or resp.status >= 500:
+            if resp.status in (403, 429) or resp.status >= 500:
                 after = resp.headers.get("Retry-After")
                 raise _Refused(resp.status, float(after) if after and after.isdigit() else None)
+            if resp.status >= 400:  # not a refusal, and not "no such song" either
+                raise RuntimeError(f"Shazam answered HTTP {resp.status}")
             return await resp.json(content_type=None)
 
 
@@ -82,22 +92,42 @@ class Recognizer:
         self._shazam = Shazam(http_client=_Http())
         self._cool_until = 0.0
         self._refusals = 0
+        self._tokens = float(BURST)
+        self._filled_at = time.monotonic()
 
-    async def recognize(self, wav: bytes) -> Match | None:
+    def cooling(self) -> float:
+        """Seconds until Shazam is asked again after refusing (0: it isn't refusing)."""
+        return max(0.0, self._cool_until - time.monotonic())
+
+    async def recognize(self, wav: bytes, wait: bool = False) -> Match | None:
         """The song in `wav`, None when Shazam doesn't know it. RecognizerBusy while Shazam is
-        refusing calls: then nothing is sent at all, so the refusal can wear off."""
-        wait = self._cool_until - time.monotonic()
-        if wait > 0:
-            raise RecognizerBusy(wait)
+        refusing calls, or (unless `wait`) while the budget of calls is spent: then nothing is
+        sent at all."""
+        while True:
+            now = time.monotonic()
+            if self._cool_until > now:
+                raise RecognizerBusy(self._cool_until - now)
+            self._tokens = min(BURST, self._tokens + max(0.0, now - self._filled_at) / REFILL_S)
+            self._filled_at = now
+            if self._tokens >= 1:
+                break
+            short = (1 - self._tokens) * REFILL_S
+            if not wait:
+                raise RecognizerBusy(short, refused=False)
+            await asyncio.sleep(short)
+        self._tokens -= 1
         try:
             result = await self._shazam.recognize(wav)
         except _Refused as e:
-            self._refusals += 1
-            wait = max(COOL_S[min(self._refusals, len(COOL_S)) - 1], e.retry_after or 0)
-            self._cool_until = time.monotonic() + wait
-            log.warning("Shazam refused a call (%s): none sent for %d s", e, wait)
-            raise RecognizerBusy(wait) from e
-        self._refusals = 0
+            now = time.monotonic()
+            if now >= self._cool_until:  # one escalation per episode: calls sent together refuse together
+                self._refusals += 1
+                wait_s = max(COOL_S[min(self._refusals, len(COOL_S)) - 1], e.retry_after or 0)
+                self._cool_until = now + wait_s
+                log.warning("Shazam refused a call (%s): none sent for %d s", e, wait_s)
+            raise RecognizerBusy(self._cool_until - now) from e
+        if time.monotonic() >= self._cool_until:
+            self._refusals = 0
         matches = result.get("matches") or []
         track = result.get("track")
         if not matches or not track:

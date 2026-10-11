@@ -6,6 +6,7 @@ const map = {
   '@zos/display': STUBS,
   '@zos/sensor': STUBS,
   '@zos/settings': STUBS,
+  '@zos/ble': STUBS,
   '@zos/media': STUBS,
   '@zos/fs': STUBS,
   '@zeppos/zml/base-page': STUBS,

@@ -25,6 +25,12 @@ export class Vibrator {
   stop() {}
 }
 
+// @zos/ble: the phone link, up unless a test says otherwise
+export const ble = { up: true }
+export function connectStatus() {
+  return ble.up
+}
+
 // @zos/settings
 export function getSystemInfo() {
   return { minAPI: '5.0', firmwareVersion: 'test' }
@@ -55,13 +61,15 @@ export function create() {
   }
 }
 
-// @zos/fs: no files ever appear (so every recording comes back empty)
+// @zos/fs: a recording is `files.take` (null: it comes back empty), there only once the
+// recorder has stopped, as on a T-Rex 3
+export const files = { take: null }
 export const O_RDONLY = 0
 export function statSync() {
-  return { size: 0 }
+  return { size: mic.on || !files.take ? 0 : files.take.byteLength }
 }
 export function readFileSync() {
-  return null
+  return mic.on ? null : files.take
 }
 export function writeFileSync() {}
 export function rmSync() {}

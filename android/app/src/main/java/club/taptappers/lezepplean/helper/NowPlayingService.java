@@ -2,6 +2,8 @@ package club.taptappers.lezepplean.helper;
 
 import android.content.ComponentName;
 import android.media.MediaMetadata;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
@@ -17,10 +19,12 @@ import java.util.List;
  * YouTube Music, Spotify, ...) publishes one, and Android shows them only to an app with
  * notification access: that is the only reason this is a notification listener. Every change
  * goes to the server at once; while something plays, also every 10 s, so the server knows
- * the helper is still there.
+ * the helper is still there. Whatever couldn't be delivered goes again when the network is
+ * back, and if Android unbinds the listener, it asks to be bound again.
  */
 public class NowPlayingService extends NotificationListenerService {
     static final long HEARTBEAT_MS = 10_000;
+    static volatile boolean playing; // this phone's player is playing: it is followed, never heard (ListenService)
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final List<MediaController> controllers = new ArrayList<>();
@@ -48,12 +52,24 @@ public class NowPlayingService extends NotificationListenerService {
 
     private final MediaSessionManager.OnActiveSessionsChangedListener onSessions = this::follow;
 
+    private final ConnectivityManager.NetworkCallback onNetwork = new ConnectivityManager.NetworkCallback() {
+        @Override
+        public void onAvailable(Network network) {
+            Reporter.get(NowPlayingService.this).networkBack();
+        }
+    };
+
     @Override
     public void onListenerConnected() {
         sessions = getSystemService(MediaSessionManager.class);
         me = new ComponentName(this, NowPlayingService.class);
         sessions.addOnActiveSessionsChangedListener(onSessions, me, main);
         follow(sessions.getActiveSessions(me));
+        try {
+            getSystemService(ConnectivityManager.class).registerDefaultNetworkCallback(onNetwork);
+        } catch (RuntimeException e) {
+            // no network callbacks: the retries alone get it there
+        }
     }
 
     @Override
@@ -62,6 +78,13 @@ public class NowPlayingService extends NotificationListenerService {
         for (MediaController c : controllers) c.unregisterCallback(callback);
         controllers.clear();
         main.removeCallbacks(heartbeat);
+        try {
+            getSystemService(ConnectivityManager.class).unregisterNetworkCallback(onNetwork);
+        } catch (RuntimeException e) {
+            // it wasn't registered
+        }
+        // Unbound by the system (an update, a killed process), not by the user: be bound again.
+        requestRebind(new ComponentName(this, NowPlayingService.class));
     }
 
     private void follow(List<MediaController> active) {
@@ -88,6 +111,7 @@ public class NowPlayingService extends NotificationListenerService {
     private void report() {
         main.removeCallbacks(heartbeat);
         Snapshot now = Snapshot.of(current());
+        playing = now.playing;
         if (now.worthSending(last)) {
             Reporter.get(this).send(now);
             last = now;

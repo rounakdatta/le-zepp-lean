@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 STALE_S = 35.0  # no word from the helper this long while "playing" (it heartbeats every 10 s): don't trust it
 OFFSET_SAMPLES = 40
+HEARD_FRESH_S = 20.0  # what the phone's mic named (listen.py) is offered to the watch this long
 
 
 @dataclass
@@ -32,6 +33,7 @@ class Snapshot:
     album: str | None = None
     duration_ms: int | None = None
     playing: bool = False
+    buffering: bool = False   # skipping, or the stream stalled: still this player's music, just no sound yet
     position_ms: float = 0.0  # where the track was at server time `at`
     at: float = 0.0           # time.time()
     speed: float = 1.0
@@ -45,6 +47,31 @@ class Phone:
         self.now = Snapshot()
         self._changed = asyncio.Event()
         self._lags: deque[float] = deque(maxlen=OFFSET_SAMPLES)
+        self.heard: dict | None = None
+        self.heard_at = 0.0
+
+    def clock(self, sent_ms, received: float) -> float:
+        """Add this to a time on the phone's clock (ms) for the server's. The fastest delivery
+        seen bounds the difference best."""
+        if isinstance(sent_ms, (int, float)) and sent_ms > 0:
+            self._lags.append(received * 1000 - sent_ms)
+        return min(self._lags) if self._lags else 0.0
+
+    def _heard_view(self, t: float) -> dict | None:
+        """What the phone's mic named, fresh, with the song where it is at `t` (a report that it
+        hears nothing has no song, nor position)."""
+        if not self.heard or t - self.heard_at >= HEARD_FRESH_S:
+            return None
+        h = dict(self.heard)
+        if "positionMs" in h:
+            h["positionMs"] = round(h["positionMs"] + (t - self.heard_at) * 1000)
+        return h
+
+    def hear(self, heard: dict, t: float) -> None:
+        """The phone's mic named a song (listen.py): the watch hears of it like any change.
+        `heard` holds where the song was at `t`."""
+        self.heard, self.heard_at = heard, t
+        self.bump()
 
     def position(self, t: float) -> float:
         s = self.now
@@ -56,9 +83,9 @@ class Phone:
         version, so that the watch hears of it (only the view used to say so, and the watch,
         seeing no new version, followed the old one for good)."""
         s = self.now
-        if s.playing and t - s.updated > STALE_S:
+        if (s.playing or s.buffering) and t - s.updated > STALE_S:
             at = s.updated + STALE_S
-            s.position_ms, s.at, s.playing = self.position(at), at, False
+            s.position_ms, s.at, s.playing, s.buffering = self.position(at), at, False, False
             self.bump()
 
     def update(self, body: dict, received: float) -> bool:
@@ -66,25 +93,25 @@ class Phone:
         sent = body.get("sentAt")
         late_ms = 0.0
         if isinstance(sent, (int, float)) and sent > 0:
-            lag = received * 1000 - sent
-            self._lags.append(lag)
-            late_ms = max(0.0, lag - min(self._lags))
+            late_ms = max(0.0, received * 1000 - sent - self.clock(sent, received))
         title = str(body.get("title") or "").strip()
         artist = str(body.get("artist") or "").strip()
         app = str(body.get("app") or "")
         duration = body.get("durationMs")
         duration = int(duration) if isinstance(duration, (int, float)) and duration > 0 else None
         playing = body.get("state") == "playing"
+        buffering = body.get("state") == "buffering"
         speed = float(body.get("speed") or 1.0) or 1.0
         position = float(body.get("positionMs") or 0.0) + (late_ms * speed if playing else 0.0)
         track = (app, name_key(title), name_key(artist), round(duration / 1000) if duration else None)
         s = self.now
         new_track = track != s.track
         moved = abs(position - self.position(received)) > 250
-        changed = new_track or playing != s.playing or (playing and moved) or (not playing and abs(position - s.position_ms) > 250)
+        changed = (new_track or playing != s.playing or buffering != s.buffering or (playing and moved)
+                   or (not playing and abs(position - s.position_ms) > 250))
         s.app, s.title, s.artist, s.album = app, title, artist, (body.get("album") or None)
         s.duration_ms = duration
-        s.playing, s.speed, s.position_ms, s.at, s.updated = playing, speed, position, received, received
+        s.playing, s.buffering, s.speed, s.position_ms, s.at, s.updated = playing, buffering, speed, position, received, received
         if new_track:
             s.track = track
             s.song_id = None
@@ -103,7 +130,7 @@ class Phone:
         self.expire(now())
         if self.now.version != since:
             return self.now
-        if self.now.playing:
+        if self.now.playing or self.now.buffering:
             timeout = min(timeout, max(0.0, self.now.updated + STALE_S - now()) + 0.01)
         changed = self._changed
         try:
@@ -124,10 +151,12 @@ class Phone:
             "artist": s.artist,
             "durationMs": s.duration_ms,
             "playing": s.playing,
+            "active": s.playing or s.buffering,  # the player's music, sounding or about to: it comes first
             "positionMs": round(self.position(t)),
             "speed": s.speed,
             "songId": s.song_id,
             "ageMs": round((t - s.updated) * 1000) if s.updated else None,
+            "heard": self._heard_view(t),
         }
 
 

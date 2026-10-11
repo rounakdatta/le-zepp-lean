@@ -46,7 +46,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from . import __version__, phone, roman, track, zepp_opus
+from . import __version__, listen, phone, roman, track, zepp_opus
 from .align import MIN_LINE_CONFIDENCE
 from .lyrics import LyricsFinder
 from .prepare import Preparer
@@ -94,8 +94,9 @@ _http = httpx.AsyncClient(follow_redirects=True)
 _recognizer = Recognizer()
 _lyrics = LyricsFinder(_http)
 _store = SongStore(DATA / "songs")
-_preparer = Preparer(_store, _recognizer.recognize, threads=THREADS)
+_preparer = Preparer(_store, lambda wav: _recognizer.recognize(wav, wait=True), threads=THREADS)
 _phone = phone.Phone()
+_listening = listen.Recordings()
 _recent: deque[dict] = deque(maxlen=30)
 
 
@@ -161,6 +162,17 @@ class PhoneUpdate(BaseModel):
     positionMs: float = 0.0  # where the track was at sentAt
     speed: float = 1.0
     sentAt: float | None = None  # the phone's clock, ms since 1970
+
+
+class ListenChunk(BaseModel):
+    """A piece of what the phone's mic hears, from the LeZeppLean helper (android/)."""
+    session: str
+    startedAt: float          # the phone's clock (ms since 1970) at the recording's first sample
+    offset: int               # this piece's first sample, counted from the recording's first
+    rate: int = listen.RATE
+    pcm: str = ""             # base64, 16-bit little-endian mono
+    sentAt: float | None = None  # the phone's clock when this was sent
+    quiet: bool = False       # the phone hears nothing (its first second was silent): no audio comes
 
 
 class LyricsRequest(BaseModel):
@@ -339,7 +351,7 @@ def _refresh_lyrics_if_due(song: Song) -> None:
     asyncio.get_running_loop().create_task(refresh())
 
 
-async def _song_for(match, position_ms: float | None = None) -> Song:
+async def _song_for(match, position_ms: float | None = None, wait_s: float = LYRICS_WAIT_S) -> Song:
     """The stored song for a Shazam match, created (with its lyrics) on first sight."""
     # Shazam's key is stable per recording; without one, a hash of the names (never hash():
     # it changes with every process, and the song would be "new" after each restart)
@@ -357,7 +369,7 @@ async def _song_for(match, position_ms: float | None = None) -> Song:
     _refreshing.add(song.id)  # the first lookup is one under way (see _refresh_lyrics_if_due)
     lookup = asyncio.get_running_loop().create_task(_first_lyrics(song, position_ms))
     try:
-        await asyncio.wait_for(asyncio.shield(lookup), LYRICS_WAIT_S)
+        await asyncio.wait_for(asyncio.shield(lookup), wait_s)
     except asyncio.TimeoutError:
         log.info("lyrics for %s still coming after %.1f s: answering with its name", song_id, LYRICS_WAIT_S)
     return song
@@ -486,6 +498,71 @@ async def phone_update(req: PhoneUpdate, authorization: str | None = Header(None
         snap = _phone.now
         asyncio.get_running_loop().create_task(_resolve_phone_track(snap.track, snap.app, snap.title, snap.artist, snap.album, snap.duration_ms))
     return {"ok": True, "version": _phone.now.version, "songId": _phone.now.song_id}
+
+
+@app.post("/listen/audio")
+async def listen_audio(req: ListenChunk, authorization: str | None = Header(None)) -> dict:
+    """What the phone hears while the watch looks for a song. `done` tells the helper to stop."""
+    _check_token(authorization)
+    if req.rate != listen.RATE:
+        raise HTTPException(status_code=422, detail=f"{listen.RATE} Hz only")
+    if req.offset < 0:
+        raise HTTPException(status_code=422, detail="offset < 0")
+    t = time.time()
+    rec = _listening.get(req.session[:64], (req.startedAt + _phone.clock(req.sentAt, t)) / 1000, t)
+    _phone.expire(t)
+    if not rec.done and (_phone.now.playing or _phone.now.buffering):
+        rec.finish("phone_playing")  # the phone's own player comes first: it is followed, not heard
+    if not rec.done and req.quiet and t - rec.start_at <= listen.MAX_AGE_S:
+        rec.finish("quiet")  # needs no Shazam call: passed on even while Shazam refuses
+        _phone.hear({"id": rec.id, "quiet": True}, t)  # a song only the phone heard has stopped
+    if not rec.done and _recognizer.cooling():
+        rec.finish("busy")  # Shazam is refusing calls: no point sending more
+    if not rec.done and t - rec.start_at > listen.MAX_AGE_S:
+        rec.finish("stale")  # held up somewhere: too old to name as what plays now
+    if not rec.done:
+        rec.put(req.offset, base64.b64decode(req.pcm))
+        if rec.due():
+            rec.asking = True
+            asyncio.get_running_loop().create_task(_hear(rec))
+    return {"ok": True, "done": rec.done or rec.seconds >= listen.MAX_S, "reason": rec.reason}
+
+
+async def _hear(rec: listen.Listening) -> None:
+    """Ask Shazam about what the phone has heard so far. Named: the watch hears of it at once."""
+    found = None
+    try:
+        pcm = bytes(rec.pcm)
+        level = _level_dbfs(pcm)["rmsDb"]
+        if level is not None and level < listen.QUIET_DB:
+            log.info("listening %s: quiet (%.0f dBFS), Shazam not asked", rec.id, level)
+            if rec.asked == 0:  # silence from the start: say so (it stops a song only the phone heard)
+                rec.finish("quiet")
+                _phone.hear({"id": rec.id, "quiet": True}, time.time())
+        else:
+            found = await asyncio.wait_for(_recognizer.recognize(zepp_opus.pcm_to_wav(pcm), wait=True), RECOGNIZE_TIMEOUT_S)
+    except RecognizerBusy:
+        rec.finish("busy")  # Shazam is refusing calls: asking again with more audio won't help
+    except Exception as e:  # noqa: BLE001  a timeout, or ShazamIO failing: maybe with more audio
+        log.warning("listening %s: %s: %s", rec.id, type(e).__name__, e)
+    finally:
+        rec.asking = False
+        rec.asked += 1
+    if rec.done:
+        return
+    if found is None:
+        if rec.asked >= len(listen.ASK_AT_S):
+            rec.finish("no_match")
+        elif rec.due():  # more came in meanwhile
+            rec.asking = True
+            await _hear(rec)
+        return
+    rec.finish("found")
+    song = await _song_for(found, found.offset_ms + (time.time() - rec.start_at) * 1000 + 3000, wait_s=0)
+    t = time.time()
+    _phone.hear({"id": rec.id, "songId": song.id, "title": song.title, "artist": song.artist,
+                 "durationMs": song.duration_ms, "positionMs": found.offset_ms + (t - rec.start_at) * 1000}, t)
+    log.info("the phone heard %s (%s)", song.id, rec.id)
 
 
 @app.get("/phone/next")

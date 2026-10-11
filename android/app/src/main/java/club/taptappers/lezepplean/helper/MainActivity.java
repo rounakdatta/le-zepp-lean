@@ -1,8 +1,11 @@
 package club.taptappers.lezepplean.helper;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
@@ -36,6 +39,9 @@ public class MainActivity extends Activity {
     private EditText token;
     private TextView connection;
     private TextView status;
+    private Button listenSwitch;
+    private TextView listenStatus;
+    private boolean micRefused;
     private Reporter reporter;
 
     private final Runnable refresh = new Runnable() {
@@ -95,6 +101,20 @@ public class MainActivity extends Activity {
         connection = text("", 15, false);
         col.addView(connection, spaced(6));
 
+        col.addView(text("3. Listen with this phone too", 18, true), spaced(28));
+        col.addView(text("When the watch looks for a song, this phone listens as well: its mic hears far better than "
+                + "the watch's, in a gym too. Never while this phone plays music (that is followed exactly), and only "
+                + "for a few seconds at a time. Android shows a small notification while it's ready.", 15, false), spaced(6));
+        TextView battery = text("For it to answer with the screen off: Settings → Apps → LeZeppLean → Battery → Unrestricted "
+                + "(on vivo, also allow background activity).", 13, false);
+        battery.setAlpha(0.7f);
+        col.addView(battery, spaced(6));
+        listenSwitch = new Button(this);
+        listenSwitch.setOnClickListener(v -> toggleListening());
+        col.addView(listenSwitch, spaced(8));
+        listenStatus = text("", 15, false);
+        col.addView(listenStatus, spaced(6));
+
         col.addView(text("Now", 18, true), spaced(28));
         status = text("", 15, false);
         col.addView(status, spaced(6));
@@ -109,6 +129,43 @@ public class MainActivity extends Activity {
         super.onResume();
         main.post(refresh);
         if (allowed()) NotificationListenerService.requestRebind(new ComponentName(this, NowPlayingService.class));
+        // armed again after a restart: Android only lets it start while this screen is open
+        if (listening() && micAllowed()) ListenService.start(this);
+    }
+
+    private boolean listening() {
+        return reporter.prefs.getBoolean("listen", false);
+    }
+
+    private boolean micAllowed() {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void toggleListening() {
+        if (listening()) {
+            reporter.prefs.edit().putBoolean("listen", false).apply();
+            ListenService.stop(this);
+        } else if (micAllowed()) {
+            reporter.prefs.edit().putBoolean("listen", true).apply();
+            ListenService.start(this);
+        } else {
+            String[] ask = Build.VERSION.SDK_INT >= 33
+                    ? new String[] {Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS}
+                    : new String[] {Manifest.permission.RECORD_AUDIO};
+            requestPermissions(ask, 1);
+        }
+        show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(code, permissions, results);
+        micRefused = code == 1 && !micAllowed();
+        if (code == 1 && !micRefused) {
+            reporter.prefs.edit().putBoolean("listen", true).apply();
+            ListenService.start(this);
+        }
+        show();
     }
 
     @Override
@@ -122,6 +179,10 @@ public class MainActivity extends Activity {
         access.setText(ok ? "Allowed." : "Not allowed yet.");
         accessHint.setVisibility(ok ? View.GONE : View.VISIBLE);
         allow.setVisibility(ok ? View.GONE : View.VISIBLE);
+        listenSwitch.setText(listening() ? "Turn off" : "Turn on");
+        listenStatus.setText(listening() ? ListenService.status
+                : micRefused ? "The microphone wasn't allowed. To change that: Settings → Apps → LeZeppLean → Permissions → Microphone."
+                : "Off");
         long ago = reporter.lastAt == 0 ? -1 : (System.currentTimeMillis() - reporter.lastAt) / 1000;
         status.setText(reporter.lastResult + (ago < 0 ? "" : ago < 2 ? " (just now)" : " (" + ago + " s ago)"));
     }

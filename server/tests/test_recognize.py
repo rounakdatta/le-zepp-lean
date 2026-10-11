@@ -21,9 +21,9 @@ class FakeShazam:
 
 
 def recognizer(answers, monkeypatch, clock):
+    monkeypatch.setattr(recognize.time, "monotonic", lambda: clock[0])
     r = recognize.Recognizer()
     r._shazam = FakeShazam(answers)
-    monkeypatch.setattr(recognize.time, "monotonic", lambda: clock[0])
     return r
 
 
@@ -67,6 +67,21 @@ def test_a_search_while_shazam_refuses_is_answered_at_once(api, monkeypatch):
 
 
 
+def test_no_burst_of_calls_goes_out_however_many_searches_come_in(monkeypatch):
+    clock = [0.0]
+    r = recognizer([{"matches": []}] * 40, monkeypatch, clock)
+    sent = 0
+    for _ in range(40):  # 40 searches at once: only a burst's worth reach Shazam
+        try:
+            asyncio.run(r.recognize(b""))
+            sent += 1
+        except recognize.RecognizerBusy as e:
+            assert 0 < e.retry_in <= recognize.REFILL_S
+    assert sent == recognize.BURST
+    clock[0] += 60  # a minute later: the budget is back
+    asyncio.run(r.recognize(b""))
+    assert r._shazam.calls == recognize.BURST + 1
+
 def test_a_429_is_a_refusal_even_with_a_json_body_never_a_song_not_found():
     from aiohttp import web
 
@@ -87,3 +102,68 @@ def test_a_429_is_a_refusal_even_with_a_json_body_never_a_song_not_found():
     asyncio.run(main())
 
 from test_api import api, music, watch_file  # noqa: E402,F401  (the api fixture)
+
+
+def test_background_work_waits_its_turn_instead_of_failing(monkeypatch):
+    clock = [0.0]
+    r = recognizer([{"matches": []}] * (recognize.BURST + 1), monkeypatch, clock)
+    slept = []
+
+    async def sleep(s):
+        slept.append(s)
+        clock[0] += s
+
+    monkeypatch.setattr(recognize.asyncio, "sleep", sleep)
+    for _ in range(recognize.BURST):
+        asyncio.run(r.recognize(b""))
+    with pytest.raises(recognize.RecognizerBusy) as e:  # a search can't wait: it is told how long
+        asyncio.run(r.recognize(b""))
+    assert e.value.refused is False and e.value.retry_in <= recognize.REFILL_S
+    assert asyncio.run(r.recognize(b"", wait=True)) is None  # a reference check waits for its turn
+    assert 0 < sum(slept) <= recognize.REFILL_S
+
+
+def test_refusals_of_calls_sent_together_count_once(monkeypatch):
+    clock = [0.0]
+    r = recognizer([], monkeypatch, clock)
+    gate = asyncio.Event()
+
+    class Together:
+        async def recognize(self, _wav):
+            await gate.wait()  # all three are out before the first refusal comes back
+            raise recognize._Refused(429, None)
+
+    r._shazam = Together()
+
+    async def three():
+        calls = [asyncio.ensure_future(r.recognize(b"")) for _ in range(3)]
+        await asyncio.sleep(0)
+        gate.set()
+        return await asyncio.gather(*calls, return_exceptions=True)
+
+    outcomes = asyncio.run(three())
+    assert all(isinstance(o, recognize.RecognizerBusy) for o in outcomes)
+    assert r._refusals == 1, "one episode: the shortest cool-down, not 120 s"
+    assert 0 < r.cooling() <= recognize.COOL_S[0]
+
+
+def test_a_403_is_a_refusal_and_other_errors_are_not_a_song_not_found():
+    from aiohttp import web
+
+    async def main(status):
+        app = web.Application()
+        app.router.add_post("/tag", lambda _req: web.json_response({}, status=status))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            await recognize._Http().request("POST", f"http://127.0.0.1:{port}/tag", json={})
+        finally:
+            await runner.cleanup()
+
+    with pytest.raises(recognize._Refused):
+        asyncio.run(main(403))
+    with pytest.raises(RuntimeError):
+        asyncio.run(main(400))
