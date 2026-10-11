@@ -81,6 +81,9 @@ class Phone:
         h = dict(self.heard)
         if "positionMs" in h:
             h["positionMs"] = round(h["positionMs"] + (t - self.heard_at) * 1000)
+        started = h.pop("startedAt", None)
+        if started is not None:  # when the audio it is about began: news older than a stop is about the music before it
+            h["startedAgoMs"] = round((t - started) * 1000)
         return h
 
     def hear(self, heard: dict, t: float) -> None:

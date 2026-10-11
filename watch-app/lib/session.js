@@ -48,11 +48,28 @@ const LOCAL_LAG = 10
 // started up to 15 s after the time it was anchored to.
 export const MAX_WINDOW_PACKETS = 100
 const LOUD_SHARE = 0.6 // a window worth identifying is mostly music
-// Re-syncs come quickly at first (they also measure the playback speed, which needs matches
-// spread over 30 s), then settle to every 30 s.
-const VERIFY_STEPS_MS = [10000, 10000, 20000]
-const VERIFY_MS = 30000
+// Re-syncs: every 6 s while the server has the song's own audio (placed there in milliseconds,
+// no Shazam call), every 10 s otherwise (Shazam, within its budget). They are also how a switch
+// to another song is noticed: after one, a re-sync doesn't place. At every 30 s, a switch went
+// unnoticed for 20 s (11 Oct 2026, measured in tests/sim and on the watch alike).
+const VERIFY_FAST_MS = 6000
+const VERIFY_SLOW_MS = 10000
+// A switch suspected (a re-sync that didn't place, the room no longer like the song): the
+// phone's ears are asked at once, and what they name is taken this long.
+const SUSPECT_MS = 20000
+// The phone's mic said it is still the song: for this long the watch's misses ask it again
+// rather than count towards ending the song (its own pauses still count: the phone's mic is
+// asked now and then, the watch's listens all the time).
+const VOUCH_MS = 30000
+// News from the phone's mic is about audio that began this long before it says (its clock and
+// the watch's agree to well under a second): about the music after a stop only if it began
+// this long after it.
+const HEARD_MARGIN_MS = 1000
 const IDENTIFY_RETRY_PACKETS = 50 // ~3 s of new audio before trying again
+// While looking, a take only clearly above the room's silence (quieter than music was) is
+// searched too: a quiet intro. After such a search comes back "no", the next waits this long
+// (steady noise just above the floor would cost a Shazam call every take); loud takes go always.
+const QUIET_FIND_MS = 20000
 const DOUBT_BACKOFF_MAX = 8 // after a doubtful resume, re-checks space out: 5 s, 10 s, 20 s, ... 40 s
 const ERROR_BACKOFF_MS = 6000
 // The server answers a new song within 1.5 s, lyrics or not ("pending" while its lookup
@@ -107,10 +124,16 @@ export function createSession() {
     nextLyricsAt: Infinity,
     holdUntil: 0, // after errors: no requests before this
     findHoldUntil: 0, // Shazam refusing calls (the server says until when): no song searches before this
+    quietFindAt: 0, // no search of a take that is only audible (not loud) before this
     linkUp: true, // the Bluetooth link to the phone (see onLink)
     linkDownAt: -Infinity,
     heardId: null, // the last song news from the phone's mic, acted on once
     heardOnly: false, // the song came from the phone's mic, and the watch's hasn't heard it yet
+    suspectAt: -Infinity, // when a switch to another song was last suspected
+    suspectFrom: -Infinity, // and when the audio that raised it began
+    vouchedUntil: -Infinity, // the phone's mic said it is still the song: until then, misses ask it again
+    ended: null, // { id, at }: the song that last played to its end, and when
+    lost: null, // { id, from }: the song last lost to misses, and when the audio it was lost on began
     resumeCheck: null, // { from, due }: confirm a resume once `due` arrives
     doubt: null, // { due, wait }: a "resume" the server couldn't place; the room is loud, the lyrics frozen
     provisional: false, // resumed on loudness alone; the server hasn't confirmed it is the song yet
@@ -162,9 +185,27 @@ export function looking(s) {
   return !s.song || (s.source === 'phone' && !phonePlaying(s))
 }
 
-// The phone's mic is wanted: looking for a song, or following one only it has heard.
-export function wantsPhoneEars(s) {
-  return looking(s) || s.heardOnly
+// The phone's mic is wanted: looking for a song, following one only it has heard, or a switch
+// to another song suspected.
+export function wantsPhoneEars(s, now) {
+  return looking(s) || s.heardOnly || suspecting(s, now)
+}
+
+// `from`: when the audio the watch couldn't place began (the earliest, while one suspicion
+// runs on). The phone's word on it counts only from audio that began no earlier: from before,
+// it may be the old song's last seconds.
+function suspect(s, now, from) {
+  s.suspectFrom = suspecting(s, now) ? Math.min(s.suspectFrom, from) : from
+  s.suspectAt = now
+  emit(s, 'ears') // the page asks the phone at once
+}
+
+export function suspecting(s, now) {
+  return now - s.suspectAt < SUSPECT_MS
+}
+
+function verifyEvery(s) {
+  return s.song && s.song.fast ? VERIFY_FAST_MS : VERIFY_SLOW_MS
 }
 
 function emit(s, type, extra) {
@@ -206,13 +247,21 @@ function followTrack(s, index, gain, at) {
   s.track.push([index, gain])
   if (s.track.length > MATCH_WINDOW + 2 * MATCH_LAG) s.track.shift()
   if (index % MATCH_EVERY !== 0 || s.track.length < MATCH_WINDOW + 2 * MATCH_LAG) return
+  // Each packet's expected gain is needed at every lag: worked out once (7 times over, it
+  // took most of the 0.4-0.6 s a 2 s take took to read on the watch).
+  const base = s.track[0][0] - MATCH_LAG
+  const known = []
+  const expectedFor = (i) => {
+    if (known[i - base] === undefined) known[i - base] = expectedAt(env, clock.songAt(s.clock, packetTime(s, i)))
+    return known[i - base]
+  }
   let best = -1
   for (let lag = -MATCH_LAG; lag <= MATCH_LAG; lag++) {
     const obs = []
     const exp = []
     for (let k = MATCH_LAG; k < s.track.length - MATCH_LAG; k++) {
       const [i, g] = s.track[k]
-      const e = expectedAt(env, clock.songAt(s.clock, packetTime(s, i + lag)))
+      const e = expectedFor(i + lag)
       if (e === null) continue
       obs.push(g)
       exp.push(e)
@@ -234,6 +283,7 @@ function followTrack(s, index, gain, at) {
     s.track = []
     s.check = { from: s.last + 1, due: s.last + CHECK_PACKETS }
     emit(s, 'mismatch', { correlation: best, baseline: m.baseline })
+    suspect(s, at, at - MATCH_WINDOW * PACKET_MS)
   }
 }
 
@@ -279,7 +329,7 @@ function onActivity(s, ev) {
     if (s.song && s.song.durationMs && clock.isKnown(s.clock) && !clock.isPaused(s.clock) &&
       clock.songAt(s.clock, at) > s.song.durationMs - END_ZONE_MS) {
       // The song finished: what comes next is a new song, not this one resuming.
-      endSong(s)
+      endSong(s, at)
       return
     }
     s.doubt = null // the room went quiet again: an ordinary pause
@@ -334,13 +384,15 @@ export function onTick(s, now) {
   }
   if (s.source !== 'phone' && s.song && clock.isKnown(s.clock) && !clock.isPaused(s.clock) && s.song.durationMs) {
     const pos = clock.songAt(s.clock, now)
-    if (pos > s.song.durationMs + END_GRACE_MS) endSong(s)
+    if (pos > s.song.durationMs + END_GRACE_MS) endSong(s, now)
   }
   return decide(s, now)
 }
 
-function endSong(s) {
+// `finishedAt`: when it played to its end (null: lost, not finished)
+function endSong(s, finishedAt) {
   emit(s, 'ended', { title: s.song.title })
+  if (finishedAt !== null) s.ended = { id: s.song.id, at: finishedAt }
   s.song = null
   clock.reset(s.clock)
   activity.forgetTrack(s.act)
@@ -356,9 +408,11 @@ function endSong(s) {
 
 // ---- output: what to ask the server ---------------------------------------------------
 
-function loudShare(s, from, to) {
+// The share of packets [from, to] louder than the pause threshold, or, `audible`, than the
+// room's silence (what a search needs: a quiet intro is still a song).
+function loudShare(s, from, to, audible) {
   let loud = 0
-  const threshold = activity.pauseThreshold(s.act)
+  const threshold = audible ? activity.audibleThreshold(s.act) : activity.pauseThreshold(s.act)
   for (let i = from; i <= to; i++) if ((s.gains[i % MAX_GAINS] || 0) >= threshold) loud += 1
   return loud / (to - from + 1)
 }
@@ -385,6 +439,19 @@ function request(s, kind, purpose, from, to, now, startAtOverride) {
   s.inflight = req
   s.stats.requests += 1
   return req
+}
+
+// Takes mode: how long the next take is. 'find' (long enough for Shazam) while looking, and
+// whenever the answer may have to name another song: a check for a switch, sound back that
+// isn't the song where it stopped, a doubtful resume, a song the server can place only with
+// Shazam. (Not while a re-sync is out, in case it comes back "no": a long take after every
+// re-sync left the lyrics running on through a stop twice as long, 13 s against 7 in s-talk.)
+// 'place' when the take will be sent anyway: something wants audio by the time a
+// short take would end, `ahead` ms from now (a re-sync falling due during a 2 s take waited
+// for the take after it). Otherwise 'follow': short, so the music stopping is heard soon after.
+export function takeKind(s, now, ahead) {
+  if (looking(s) || !s.song.fast || s.doubt || (s.comeback && s.comeback.failed) || (s.check && isPlaying(s))) return 'find'
+  return wantsAudio(s, now + ahead) ? 'place' : 'follow'
 }
 
 // Takes mode: will the next take probably go to the server? Then the page makes it long
@@ -417,6 +484,7 @@ export function takeRequest(s, from, to, startAt, now) {
       placed = { from: f, n: v.n }
     } else if (!v || v.n >= LOCAL_FULL_PACKETS) {
       s.comeback.failed = true // the song's track can't say: ask the server
+      if (v) suspect(s, now, v.at) // nor is it the song where it stopped: maybe another song
     }
   }
   if (s.inflight || s.noServer || now < s.holdUntil || !s.linkUp) {
@@ -440,8 +508,13 @@ export function takeRequest(s, from, to, startAt, now) {
       s.takeSkip = 'busy'
       return null
     }
-    if (n >= FIND_TAKE_PACKETS && loudShare(s, from, to) >= LOUD_SHARE) {
-      return request(s, 'identify', 'find', from, to, now, startAt)
+    if (n >= FIND_TAKE_PACKETS) {
+      const loud = loudShare(s, from, to) >= LOUD_SHARE
+      if (loud || (now >= s.quietFindAt && loudShare(s, from, to, true) >= LOUD_SHARE)) {
+        const req = request(s, 'identify', 'find', from, to, now, startAt)
+        req.quiet = !loud
+        return req
+      }
     }
     s.takeSkip = 'quiet'
     return null
@@ -467,7 +540,10 @@ export function takeRequest(s, from, to, startAt, now) {
     return request(s, 'identify', 'resume', from, to, now, startAt)
   }
   if (n < PLACE_TAKE_PACKETS) return null // a 2 s take: loudness only
-  if (s.check && isPlaying(s)) {
+  // (a take from before the room stopped sounding like the song would half-match the old place,
+  // and Shazam could name the old song in it)
+  // ...nor on a quiet one (a quiet passage of the song: three such "no"s ended it)
+  if (s.check && isPlaying(s) && from >= s.check.from && loudShare(s, from, to) >= LOUD_SHARE) {
     s.check = null
     return request(s, 'identify', 'check', from, to, now, startAt)
   }
@@ -560,6 +636,8 @@ function onHeard(s, h, now) {
   if (!h.id || h.id === s.heardId) return
   s.heardId = h.id
   if (phonePlaying(s)) return // the phone's player comes first, always
+  // when the audio it is about began, on the watch's clock (null: an older server didn't say)
+  const heardFrom = typeof h.startedAgoMs === 'number' ? now - h.startedAgoMs : null
   if (h.quiet) {
     // The phone, whose mic named the song, hears nothing now: the music stopped (the watch's
     // mic couldn't tell). Its next listen that hears the song carries it on.
@@ -567,7 +645,7 @@ function onHeard(s, h, now) {
       const pos = clock.songAt(s.clock, now)
       if (quietBetween(s.song.envelope, pos - QUIET_REPORT_SPAN_MS, pos, QUIET_PART_DROP)) return // the song, quiet
       if (s.song.durationMs && pos > s.song.durationMs - END_ZONE_MS) {
-        endSong(s) // the song finished: what comes next is looked for
+        endSong(s, now) // the song finished: what comes next is looked for
         return
       }
       clock.pause(s.clock, now)
@@ -587,14 +665,51 @@ function onHeard(s, h, now) {
     clock.addMatch(s.clock, now, h.positionMs)
     return
   }
-  if (!looking(s) && !s.heardOnly) return
+  const asked = suspecting(s, now)
+  if (asked && !looking(s) && s.song.id === h.songId) {
+    // Asked because the watch couldn't place what plays, and from audio no older than that:
+    // it is still this song. For a while the watch's misses don't count (they slow down).
+    // Where the song is, it says only from audio that began after the music last stopped or
+    // came back: from before, it ran the lyrics on through a pause.
+    if (heardFrom === null || heardFrom < s.suspectFrom) return
+    s.check = null
+    s.misses = 0
+    s.suspectAt = -Infinity
+    s.vouchedUntil = now + VOUCH_MS
+    const paused = clock.isPaused(s.clock)
+    if (heardFrom === null || heardFrom < (paused ? s.clock.pausedAt : s.clock.lastPauseEnd) + HEARD_MARGIN_MS) return
+    if (paused) {
+      if (!s.act.playing) return // and the room is quiet: stopped again since
+      clock.resume(s.clock, now)
+      s.doubt = null
+      s.comeback = null
+      s.stats.resumes += 1
+      emit(s, 'resume', { at: now, source: 'heard' })
+    }
+    clock.addMatch(s.clock, now, h.positionMs)
+    return
+  }
+  if (!looking(s) && !s.heardOnly && !asked) return
+  // Another song, from audio that began before the music stopped: what played before the stop,
+  // not now (started, it ran on through the silence until the phone listened again).
+  if (!looking(s) && clock.isPaused(s.clock) && (heardFrom === null || heardFrom < s.clock.pausedAt + HEARD_MARGIN_MS)) return
+  // News about the song that just ended, from audio that began before its end, is about its
+  // last seconds: started again, it ran on with no length to end it.
+  if (s.ended && s.ended.id === h.songId && (heardFrom === null || heardFrom < s.ended.at)) return
+  // The song just lost to misses, named again from audio no older than what the watch couldn't
+  // place: it plays on, in a room where the watch hears it but can't place it. It comes back
+  // vouched for, the watch's own pauses counting (as a song only the phone heard, a stop then
+  // went unnoticed until the phone listened again).
+  const relost = !!s.lost && s.lost.id === h.songId
+  if (relost && (heardFrom === null || heardFrom < s.lost.from)) return
   if (s.source === 'phone') leavePhone(s)
   const song = { id: h.songId, title: h.title, artist: h.artist, durationMs: h.durationMs }
   startSong(s, { song, match: { offsetMs: h.positionMs, skew: 0 } }, { startAt: now, from: s.last + 1 }, now)
   s.song.kind = 'pending' // its lyrics are asked for at once
   s.nextLyricsAt = now
-  s.nextVerifyAt = now + VERIFY_STEPS_MS[0]
-  s.heardOnly = true // until the watch's own mic places it
+  s.nextVerifyAt = now + verifyEvery(s)
+  s.heardOnly = !relost // until the watch's own mic places it
+  if (relost) s.vouchedUntil = now + VOUCH_MS
 }
 
 function followPlayer(s, view, now) {
@@ -743,9 +858,12 @@ export function decide(s, now) {
   if (looking(s)) {
     if (s.last >= s.nextIdentifyPacket && s.last >= IDENTIFY_PACKETS - 1) {
       const from = s.last - IDENTIFY_PACKETS + 1
-      if (loudShare(s, from, s.last) >= LOUD_SHARE) {
+      const loud = loudShare(s, from, s.last) >= LOUD_SHARE
+      if (loud || (now >= s.quietFindAt && loudShare(s, from, s.last, true) >= LOUD_SHARE)) {
         s.nextIdentifyPacket = s.last + IDENTIFY_RETRY_PACKETS
-        return request(s, 'identify', 'find', from, s.last, now)
+        const req = request(s, 'identify', 'find', from, s.last, now)
+        req.quiet = !loud
+        return req
       }
     }
     return null
@@ -753,9 +871,13 @@ export function decide(s, now) {
   // 3. The room stopped sounding like the song: check where the music is, with enough
   // fresh audio for Shazam in case it is a different song.
   if (s.check && s.last >= s.check.due) {
-    const from = Math.max(s.check.from, s.playingFrom)
-    s.check = null
-    if (isPlaying(s) && s.last - from + 1 >= VERIFY_PACKETS) return request(s, 'identify', 'check', from, s.last, now)
+    const from = Math.max(s.check.from, s.playingFrom, s.last - CHECK_PACKETS + 1)
+    if (isPlaying(s) && s.last - from + 1 >= VERIFY_PACKETS && loudShare(s, from, s.last) >= LOUD_SHARE) {
+      s.check = null
+      return request(s, 'identify', 'check', from, s.last, now)
+    }
+    if (isPlaying(s)) s.check.due = s.last + MATCH_EVERY // quiet: wait for the music
+    else s.check = null
   }
   // 4. Playing: re-check the position now and then. Never before a pending resume check
   // (it is the more urgent question), and never with a window that reaches back into the
@@ -858,17 +980,19 @@ export function onResponse(s, req, res, now) {
       s.comeback = null // placed, whoever asked (left behind, it stopped every later re-sync)
     }
     s.heardOnly = false // the watch's own mic has the song now
+    s.suspectAt = -Infinity // and it is still the song
     mergeSongData(s, res, now)
   }
   s.misses = 0
   s.matches += 1
-  s.nextVerifyAt = now + (s.matches <= VERIFY_STEPS_MS.length ? VERIFY_STEPS_MS[s.matches - 1] : VERIFY_MS)
+  s.nextVerifyAt = now + verifyEvery(s)
 }
 
 function onMiss(s, req, res, now) {
   if (req.purpose === 'find') {
     // Shazam refusing calls: the takes meanwhile would only be refused too (and cost Bluetooth)
     if (res.reason === 'recognizer_busy') s.findHoldUntil = now + (res.retryInMs || 30000)
+    if (req.quiet && res.reason === 'no_match') s.quietFindAt = now + QUIET_FIND_MS
     emit(s, 'miss', { reason: res.reason })
     return
   }
@@ -902,8 +1026,14 @@ function onMiss(s, req, res, now) {
     // where we were, and keep asking with 5 s while the room stays loud. (Treating the first
     // "no" as final, with a bar raised above that sound, left real music unable to resume.)
     if (s.song && clock.isKnown(s.clock) && !clock.isPaused(s.clock)) clock.pause(s.clock, req.startAt)
-    const wait = s.doubt ? Math.min(s.doubt.wait * 2, IDENTIFY_PACKETS * DOUBT_BACKOFF_MAX) : IDENTIFY_PACKETS
+    // Most often it is another song (the one before was skipped or ended in a gap): the first
+    // "no" is asked again with the very next take, long enough for Shazam, and the phone's ears
+    // are asked at once. It waited 5 s, then 10, 20, 40: a new song took 70 s to appear (11
+    // Oct 2026). Only then less and less often (talking, noise: each ask costs a Shazam call).
+    const first = s.mode === 'takes' ? 1 : IDENTIFY_PACKETS
+    const wait = s.doubt ? Math.min(Math.max(IDENTIFY_PACKETS, s.doubt.wait * 2), IDENTIFY_PACKETS * DOUBT_BACKOFF_MAX) : first
     s.doubt = { due: s.last + wait, wait }
+    suspect(s, now, req.startAt)
     s.comeback = null // the doubt asks from here on
     s.provisional = false
     if (s.levelAtPause !== null) s.act.musicLevel = s.levelAtPause // undo anything the sound taught it
@@ -920,12 +1050,31 @@ function onMiss(s, req, res, now) {
     s.nextVerifyAt = now + 15000
     return
   }
+  // Stopped since: what comes back is checked on its own (a check left waiting made every take
+  // during the pause a long one, and the music coming back was noticed later).
+  if (clock.isPaused(s.clock)) return
+  if (now < s.vouchedUntil) {
+    // The phone's mic said just now that it is the song: not counted, and the re-syncs slow
+    // down meanwhile (each is a Shazam call when the song's audio can't place it). A switch to
+    // a song Shazam knows is still named by them.
+    s.nextVerifyAt = now + 15000
+    return
+  }
+  // Most often the music moved on to another song: look again with the very next take, long
+  // enough for Shazam to name a new one, and ask the phone's ears at once (this waited 15 s,
+  // and a switch took 20 s to follow). Each check is a search too, so a new song is usually
+  // named by the first or second. Three misses in a row: the song is lost, and looked for
+  // afresh (two ended songs in a room too faint for the watch to place every take).
   s.misses += 1
-  s.nextVerifyAt = now + (s.misses >= 2 ? 5000 : 15000)
   if (s.misses >= 3) {
     emit(s, 'lost', { title: s.song ? s.song.title : null })
-    endSong(s)
+    s.lost = { id: s.song.id, from: s.suspectFrom }
+    endSong(s, null) // (not finished: the phone's mic may yet name it, and is listened to)
+    return
   }
+  s.check = { from: s.last + 1, due: s.last + CHECK_PACKETS } // (takes mode: the next take of fresh music)
+  s.nextVerifyAt = now + verifyEvery(s)
+  suspect(s, now, req.startAt)
 }
 
 function maxGain(s, from, to) {
@@ -962,6 +1111,9 @@ function startSong(s, res, req, now) {
   s.comeback = null
   s.doubt = null
   s.heardOnly = false
+  s.suspectAt = -Infinity
+  s.vouchedUntil = -Infinity
+  s.lost = null
   s.provisional = false
   s.retries = 0
   s.quietAt = null

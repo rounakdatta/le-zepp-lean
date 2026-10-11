@@ -26,6 +26,19 @@ def music(seconds: float, seed: int = 1) -> np.ndarray:
     return out
 
 
+def notes(seconds: float, seed: int) -> np.ndarray:
+    """Notes over a faint noise floor (a room's, or a recording's), as tests/test_track.py's song."""
+    rng = np.random.default_rng(seed)
+    out = np.zeros(int(seconds * SR), dtype=np.float32)
+    t = 0
+    while t < len(out):
+        n = int(rng.uniform(0.15, 0.6) * SR)
+        k = np.arange(min(n, len(out) - t))
+        out[t:t + len(k)] += (np.sin(2 * np.pi * rng.uniform(150, 2000) * k / SR) * np.exp(-k / (0.3 * SR))).astype(np.float32) * rng.uniform(0.2, 0.8)
+        t += n
+    return out + rng.standard_normal(len(out)).astype(np.float32) * 0.01
+
+
 def watch_file(x: np.ndarray) -> str:
     framed = b"".join(len(p).to_bytes(4, "big") + b"\0\0\0\0" + p for p in silk.encode_like_watch(x))
     return base64.b64encode(framed).decode()
@@ -98,6 +111,32 @@ def test_a_known_song_is_re_synced_from_its_own_audio_without_shazam(api):
     assert abs(r["match"]["offsetMs"] - (20_000 + 250)) < 30            # reference time mapped onto the watch's
     assert calls["shazam"] == before
     assert r["timing"]["totalMs"] < 500
+
+
+def test_a_take_where_another_song_comes_in_is_not_placed_in_the_song_on_screen(api):
+    # A song switch: the take starts quiet, then the next song comes in. Every band rises at
+    # once, as this song does where it starts after its silence: it was placed there
+    # ("track-wide", 0:00), and the lyrics went back to the start instead of the new song
+    # being looked for. Shazam names what plays.
+    client, app_module, calls = api
+    client.post("/identify", json={"audio": watch_file(music(5))})
+    store = app_module._store
+    song = store.get("k1")
+    x = np.concatenate([np.zeros(SR, np.float32), notes(60, seed=3)])
+    np.save(store.dir("k1") / "features.npy", track.features(x).astype(np.float16))
+    song.reference = {"file": "reference.m4a", "map": {"aMs": 0.0, "b": 0.0, "agreement": "5/5", "residualMs": 1}}
+    song.reference_status = "ready"
+    store.put(song)
+    quiet = np.random.default_rng(4).standard_normal(int(0.6 * SR)).astype(np.float32) * 1e-3
+    for seed in (9, 10, 11):
+        take = np.concatenate([quiet, notes(3, seed=seed)[: int(2.2 * SR)] * 0.2])
+        before = calls["shazam"]
+        r = client.post("/identify", json={"audio": watch_file(take), "purpose": "sync", "song": "k1", "expectMs": 40_000}).json()
+        assert r["match"]["method"] == "shazam" and calls["shazam"] == before + 1, (seed, r["match"])
+    # and the song itself is still placed, with nothing but its own audio
+    take = x[int(22 * SR): int(24.5 * SR)] * 0.2
+    r = client.post("/identify", json={"audio": watch_file(take), "purpose": "sync", "song": "k1", "expectMs": 22_300}).json()
+    assert r["match"]["method"] == "track" and abs(r["match"]["offsetMs"] - 22_000) < 30
 
 
 def test_word_polls_get_new_word_timings_once(api):

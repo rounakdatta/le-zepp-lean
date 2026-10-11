@@ -49,7 +49,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ListenService extends Service {
     static final int PORT = 47391;
     private static final String CHANNEL = "listening";
-    private static final long EVERY_MS = 20_000; // one recording at most this often, whoever asks
+    private static final long EVERY_MS = 8_000; // one recording at most this often, whoever asks (one lasts up to 8 s)
     private static final long STALE_MS = 12_000; // a piece held up this long is no use: stop
     static volatile String status = "Off";
 

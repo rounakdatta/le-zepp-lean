@@ -19,6 +19,12 @@ import { statSync, readFileSync, rmSync } from '@zos/fs'
 
 const SETTLE_POLL_MS = 100
 const SETTLE_MAX_MS = 2500
+// After STOP, the size is read this often until five reads in a row agree (100 ms without a
+// write: a shorter wait could fall between two writes of the last packets, and a take short of
+// them is timed late by them all). Read once, 30 ms after STOP, it still moved on 9 takes in 10,
+// and the take then waited ~310 ms for the polling below (T-Rex 3, 11 Oct 2026).
+const STOP_POLL_MS = 25
+const STOP_STABLE_READS = 5
 
 let mic = null
 let onStop = null // the take waiting for the recorder's STOP event
@@ -95,14 +101,23 @@ export function recordClip(durationMs, done, log) {
         finish({ error: 'read_failed', message: String(e), ...timing })
       }
     }
-    // Whichever is first: the STOP event (then the size, twice, 30 ms apart, must agree),
+    // Whichever is first: the STOP event (then the size, read every 25 ms until it holds),
     // or the size holding still.
     onStop = () => {
-      const a = sizeOf(name)
-      setTimeout(() => {
-        const b = sizeOf(name)
-        if (a > 0 && a === b) done(b, Date.now() - stoppedAt)
-      }, 30)
+      let last = sizeOf(name)
+      let same = 1
+      const poll = () => {
+        if (settled) return
+        const size = sizeOf(name)
+        same = size > 0 && size === last ? same + 1 : 1
+        last = size
+        if (same >= STOP_STABLE_READS) {
+          done(size, Date.now() - stoppedAt)
+          return
+        }
+        setTimeout(poll, STOP_POLL_MS)
+      }
+      setTimeout(poll, STOP_POLL_MS)
     }
     try {
       recorder.stop()

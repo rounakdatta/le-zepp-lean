@@ -11,6 +11,16 @@ over time, which removes what the room and the 17 kbps SILK codec do to the leve
 tone, and keeps what doesn't change: which bands rise and fall when. The score of a lag
 is the correlation of the two normalised spectrograms; its height and how far it stands
 out from the other lags say whether to believe it.
+
+That score has a blind spot: a rise in every band at once (a quiet clip that gets louder, a
+knock in a quiet room) dominates it, and matches wherever the song itself rises (its start
+after the silence before it, a drop). So the spectrum's shape can be compared on its own
+(`shape=True`: each frame's level across all bands taken out), and a placement must agree in
+shape too (`agreement`). On room audio of 4 songs (scripts/eval_wrong_song.py, 11 Oct 2026),
+the level alone placed another song inside the one on screen in 283 of 1,440 clips (275 of
+the 480 where the music came in after a quiet start: a song switch looks just like that), and
+the right song at the wrong place in 124 of 720. Checked by shape: 1 and 7, and the right
+song was placed right 427 times instead of 276.
 """
 
 from __future__ import annotations
@@ -25,6 +35,12 @@ HOP = 160            # 10 ms
 BANDS = 40
 FMIN, FMAX = 120.0, 7600.0
 FRAME_MS = HOP * 1000 / SAMPLE_RATE
+# Reference frames whose loudest band is this far below the song's typical loudest band (~40
+# dB), or within ~13 dB of the features' floor (log 1e-8: digital silence, whatever the song's
+# level), are silence: before and after the song, or between its parts. No window is placed
+# over them (see above: silence turning into music is the steepest rise there is).
+SILENT_DROP = 9.2
+SILENT_FLOOR = -15.4
 
 _window = np.hanning(N_FFT + 1)[:-1].astype(np.float32)
 
@@ -68,6 +84,11 @@ def _normalise(f: np.ndarray) -> np.ndarray:
     return f / (f.std(axis=0, keepdims=True) + 1e-3)
 
 
+def _shape(f: np.ndarray) -> np.ndarray:
+    """Each frame's spectrum without its overall level: how the bands stand to each other."""
+    return f - f.mean(axis=1, keepdims=True)
+
+
 @dataclass
 class Located:
     offset_ms: float     # reference time at which the window starts
@@ -76,14 +97,18 @@ class Located:
     searched_ms: tuple[float, float]
 
 
-def locate(window: np.ndarray, reference: np.ndarray, center_ms: float | None, radius_ms: float = 3000.0) -> Located | None:
+def locate(window: np.ndarray, reference: np.ndarray, center_ms: float | None, radius_ms: float = 3000.0,
+           shape: bool = False) -> Located | None:
     """Where `window` (watch audio, 16 kHz) starts inside `reference` (its features).
 
     center_ms: predicted reference time of the window start (None: search the whole song).
+    shape: compare the spectrum's shape only, not how loud each band is.
     """
-    w = _normalise(features(window))
+    f = features(window)
+    w = _normalise(_shape(f) if shape else f)
     if len(w) < 50 or len(reference) < len(w):
         return None
+    reference = np.asarray(reference, dtype=np.float32)  # (float16 sums went out of range)
     n = len(w)
     total = len(reference) - n + 1
     if center_ms is None:
@@ -95,7 +120,12 @@ def locate(window: np.ndarray, reference: np.ndarray, center_ms: float | None, r
     if hi - lo < 3:
         return None
     seg = reference[lo: hi + n - 1]
-    scores = _sliding_correlation(w, seg)
+    scores = _sliding_correlation(w, _shape(seg) if shape else seg)
+    silent = np.concatenate([[0], np.cumsum(seg.max(axis=1) < _silence_below(reference))])
+    over_silence = silent[n:] - silent[:-n] > 0
+    if over_silence.all():
+        return None
+    scores[over_silence] = -1.0
     best = int(np.argmax(scores))
     peak = float(scores[best])
     # sub-frame peak position from the parabola through the best lag and its neighbours
@@ -111,6 +141,20 @@ def locate(window: np.ndarray, reference: np.ndarray, center_ms: float | None, r
     second = float(scores[mask].max()) if mask.any() else 0.0
     return Located(offset_ms=(lo + best + frac) * FRAME_MS, score=peak, margin=peak - second,
                    searched_ms=(lo * FRAME_MS, hi * FRAME_MS))
+
+
+def agreement(window: np.ndarray, reference: np.ndarray, offset_ms: float) -> float:
+    """How well the window's spectral shape matches the reference's at offset_ms: the shape score
+    of that one lag (-1 if it doesn't fit inside the song)."""
+    w = _normalise(_shape(features(window)))
+    i = int(round(offset_ms / FRAME_MS))
+    if len(w) < 50 or i < 0 or i + len(w) > len(reference):
+        return -1.0
+    return float(_sliding_correlation(w, _shape(np.asarray(reference[i: i + len(w)], dtype=np.float32)))[0])
+
+
+def _silence_below(reference: np.ndarray) -> float:
+    return max(float(np.median(reference[::10].max(axis=1))) - SILENT_DROP, SILENT_FLOOR)
 
 
 def _sliding_correlation(w: np.ndarray, seg: np.ndarray) -> np.ndarray:

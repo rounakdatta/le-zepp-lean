@@ -89,6 +89,16 @@ TRACK_MIN_MARGIN = 0.08      # near search: best lag vs any lag 400 ms+ away (wi
 TRACK_WIDE_BETTER = 0.10     # a place elsewhere this much better wins (the music was skipped)
 TRACK_TIE = 0.03             # within this, a repeat: the clock's guess breaks the tie
 TRACK_RADIUS_MS = 3000
+# ...but rooms are rarely that kind. A quiet clip that gets louder, or a knock in a quiet
+# room, rises in every band at once and matched wherever the song rises (its first second, a
+# drop): in 283 of 1,440 clips another song was placed in the one on screen (the lyrics went
+# back to its start, and a new song went unnoticed), the right song at the wrong place in 124
+# of 720. So a placement must also agree in the spectrum's shape there; failing that, the
+# shape alone decides, with a slightly lower bar, and a place elsewhere in the song must
+# stand out as a near one does: 1 and 7 (scripts/eval_wrong_song.py, room audio at -55 to
+# -30 dB, 11 Oct 2026).
+TRACK_SHAPE_AGREE = 0.25
+TRACK_SHAPE_MIN_SCORE = 0.40
 
 _http = httpx.AsyncClient(follow_redirects=True)
 _recognizer = Recognizer()
@@ -429,23 +439,34 @@ def _locate(song: Song, pcm: bytes, expect_ms: float | None, may_jump: bool) -> 
         return None
     m = Mapping.from_dict(song.reference["map"])
     x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768
-    wide = track.locate(x, feats, None)
-    if wide is None:
-        return None
-    near = track.locate(x, feats, m.to_reference(expect_ms), TRACK_RADIUS_MS) if expect_ms is not None else None
-    found, method = None, None
-    if near is not None and abs(near.offset_ms - wide.offset_ms) < 400:
-        if near.score >= TRACK_MIN_SCORE and near.margin >= TRACK_MIN_MARGIN:
-            found, method = near, "track"                       # the clock was right, and nothing beats it
-    elif wide.score >= TRACK_MIN_SCORE + 0.05 and (near is None or wide.score >= near.score + TRACK_WIDE_BETTER):
-        if may_jump or near is None:
-            found, method = wide, "track-wide"                  # the music is somewhere else in the song
-    elif near is not None and near.score >= TRACK_MIN_SCORE + 0.05 and near.score >= wide.score - TRACK_TIE:
-        found, method = near, "track"                           # a repeat: near the clock's guess wins the tie
+    center = m.to_reference(expect_ms) if expect_ms is not None else None
+    found, method = _place(x, feats, center, may_jump, TRACK_MIN_SCORE, False)
+    if found is not None and track.agreement(x, feats, found.offset_ms) < TRACK_SHAPE_AGREE:
+        found = None                                            # a rise in the room met a rise in the song
+    if found is None:
+        found, method = _place(x, feats, center, may_jump, TRACK_SHAPE_MIN_SCORE, True)
+        method = method and method.replace("track", "track-shape")
     if found is None:
         return None
     return {"offsetMs": round(m.to_canonical(found.offset_ms), 1), "skew": m.b, "method": method,
             "score": round(found.score, 3), "margin": round(found.margin, 3)}
+
+
+def _place(x: np.ndarray, feats: np.ndarray, center: float | None, may_jump: bool, min_score: float,
+           shape: bool) -> tuple[track.Located | None, str | None]:
+    wide = track.locate(x, feats, None, shape=shape)
+    if wide is None:
+        return None, None
+    near = track.locate(x, feats, center, TRACK_RADIUS_MS, shape=shape) if center is not None else None
+    if near is not None and abs(near.offset_ms - wide.offset_ms) < 400:
+        if near.score >= min_score and near.margin >= TRACK_MIN_MARGIN:
+            return near, "track"                                # the clock was right, and nothing beats it
+    elif wide.score >= min_score + 0.05 and (near is None or wide.score >= near.score + TRACK_WIDE_BETTER):
+        if (may_jump or near is None) and (not shape or wide.margin >= TRACK_MIN_MARGIN):
+            return wide, "track-wide"                           # the music is somewhere else in the song
+    elif near is not None and near.score >= min_score + 0.05 and near.score >= wide.score - TRACK_TIE:
+        return near, "track"                                    # a repeat: near the clock's guess wins the tie
+    return None, None
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -541,7 +562,7 @@ async def listen_audio(req: ListenChunk, authorization: str | None = Header(None
         rec.finish("phone_playing")  # the phone's own player comes first: it is followed, not heard
     if not rec.done and req.quiet and t - rec.start_at <= listen.MAX_AGE_S:
         rec.finish("quiet")  # needs no Shazam call: passed on even while Shazam refuses
-        _phone.hear({"id": rec.id, "quiet": True}, t)  # a song only the phone heard has stopped
+        _phone.hear({"id": rec.id, "quiet": True, "startedAt": rec.start_at}, t)  # a song only the phone heard has stopped
     if not rec.done and _recognizer.cooling():
         rec.finish("busy")  # Shazam is refusing calls: no point sending more
     if not rec.done and t - rec.start_at > listen.MAX_AGE_S:
@@ -564,7 +585,7 @@ async def _hear(rec: listen.Listening) -> None:
             log.info("listening %s: quiet (%.0f dBFS), Shazam not asked", rec.id, level)
             if rec.asked == 0:  # silence from the start: say so (it stops a song only the phone heard)
                 rec.finish("quiet")
-                _phone.hear({"id": rec.id, "quiet": True}, time.time())
+                _phone.hear({"id": rec.id, "quiet": True, "startedAt": rec.start_at}, time.time())
         else:
             found = await asyncio.wait_for(_recognizer.recognize(zepp_opus.pcm_to_wav(pcm), wait=True), RECOGNIZE_TIMEOUT_S)
     except RecognizerBusy:
@@ -589,7 +610,8 @@ async def _hear(rec: listen.Listening) -> None:
         _store.put(song)
     t = time.time()
     _phone.hear({"id": rec.id, "songId": song.id, "title": song.title, "artist": song.artist,
-                 "durationMs": song.duration_ms, "positionMs": found.offset_ms + (t - rec.start_at) * 1000}, t)
+                 "durationMs": song.duration_ms, "positionMs": found.offset_ms + (t - rec.start_at) * 1000,
+                 "startedAt": rec.start_at}, t)
     log.info("the phone heard %s (%s)", song.id, rec.id)
 
 

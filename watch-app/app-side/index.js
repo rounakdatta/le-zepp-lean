@@ -107,16 +107,22 @@ function phoneNow() {
   if (!v) return { version: -1, title: '' }
   const since = Date.now() - phone.at + SERVER_TO_PHONE_MS
   const out = Object.assign({}, v, { positionMs: Math.round(v.positionMs + (v.playing ? since * (v.speed || 1) : 0)), sentAt: Date.now() })
-  if (v.heard && typeof v.heard.positionMs === 'number') out.heard = Object.assign({}, v.heard, { positionMs: Math.round(v.heard.positionMs + since) })
+  if (v.heard) {
+    out.heard = Object.assign({}, v.heard)
+    if (typeof v.heard.positionMs === 'number') out.heard.positionMs = Math.round(v.heard.positionMs + since)
+    if (typeof v.heard.startedAgoMs === 'number') out.heard.startedAgoMs = Math.round(v.heard.startedAgoMs + since)
+  }
   return out
 }
 
-// The watch is looking for a song: the LeZeppLean helper on this phone listens too (its mic
-// is better than the watch's), if it is set up to. Asked on the phone itself, so it costs
-// nothing when it isn't; at most every 30 s while the watch keeps looking. The request is
-// signed with the token, never carries it: whatever holds that port is told nothing.
+// The watch is looking for a song, or can't place what plays (another song?): the LeZeppLean
+// helper on this phone listens too (its mic is better than the watch's), if it is set up to.
+// Asked on the phone itself, so it costs nothing when it isn't; at most every 9 s (a listen
+// takes up to 8 s; the watch asks every 10 s at most, and a gate as long as that dropped every
+// other ask). The request is signed with the token, never carries it: whatever holds that port
+// is told nothing.
 const HELPER_URL = 'http://127.0.0.1:47391/listen'
-const LISTEN_EVERY_MS = 30000
+const LISTEN_EVERY_MS = 9000
 let listenedAt = 0
 
 function listenOnPhone() {
