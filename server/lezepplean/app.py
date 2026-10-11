@@ -50,7 +50,7 @@ from . import __version__, phone, roman, track, zepp_opus
 from .align import MIN_LINE_CONFIDENCE
 from .lyrics import LyricsFinder
 from .prepare import Preparer
-from .recognize import Recognizer
+from .recognize import Recognizer, RecognizerBusy
 from .reference import Mapping
 from .songs import Song, SongStore, lyrics_payload, words_status
 
@@ -603,6 +603,9 @@ async def identify(req: IdentifyRequest, authorization: str | None = Header(None
                 found = await asyncio.wait_for(_recognizer.recognize(wav), RECOGNIZE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 response.update(reason="recognizer_timeout")
+                return response
+            except RecognizerBusy as e:  # Shazam is refusing calls: none are sent until it stops
+                response.update(reason="recognizer_busy", retryInMs=round(e.retry_in * 1000))
                 return response
             except Exception as e:  # ShazamIO is an unofficial client; surface its failures instead of a 500
                 log.exception("recognizer failed")
