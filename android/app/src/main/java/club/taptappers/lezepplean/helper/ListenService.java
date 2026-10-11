@@ -32,8 +32,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * This phone listens too, when the watch looks for a song: the watch asks through the Zepp
- * app (a request to 127.0.0.1 here, with the server's token), and up to 8 s of what the mic
- * hears streams to the server in half-second pieces, until it has named the song.
+ * app (a request to 127.0.0.1 here, signed with the server's token, see Listening.verify),
+ * and up to 8 s of what the mic hears streams to the server in half-second pieces, until it
+ * has named the song. At most once every 20 s; a silent room stops it after a second, with
+ * nothing sent.
  *
  * Android lets an app use the mic in the background only from a foreground service started
  * while the app is on screen: so this runs, armed, from when the switch is turned on (its
@@ -43,12 +45,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ListenService extends Service {
     static final int PORT = 47391;
     private static final String CHANNEL = "listening";
+    private static final long EVERY_MS = 20_000; // one recording at most this often, whoever asks
+    private static final long STALE_MS = 12_000; // a piece held up this long is no use: stop
     static volatile String status = "Off";
 
     private final ExecutorService uploads = Executors.newSingleThreadExecutor();
     private final AtomicBoolean recording = new AtomicBoolean();
     private final AtomicBoolean serving = new AtomicBoolean();
     private volatile ServerSocket server;
+    private long lastTrigger; // the newest signed trigger taken (a copy can't be used twice)
+    private volatile long lastRecordingAt;
 
     static void start(Context c) {
         c.startForegroundService(new Intent(c, ListenService.class));
@@ -75,7 +81,6 @@ public class ListenService extends Service {
             return START_NOT_STICKY;
         }
         if (serving.compareAndSet(false, true)) new Thread(this::serve, "lezepplean-trigger").start();
-        status = "Ready: the watch can ask this phone to listen";
         return START_STICKY;
     }
 
@@ -107,26 +112,37 @@ public class ListenService extends Service {
     private void serve() {
         try (ServerSocket s = new ServerSocket(PORT, 8, InetAddress.getByName("127.0.0.1"))) {
             server = s;
+            status = "Ready: the watch can ask this phone to listen";
             while (!s.isClosed()) {
                 try (Socket c = s.accept()) {
                     c.setSoTimeout(2000);
                     Listening.Request r = Listening.read(c.getInputStream());
-                    boolean listen = r != null && "/listen".equals(r.path)
-                            && Listening.authorized(r.authorization, Reporter.get(this).token());
-                    c.getOutputStream().write(Listening.reply(r == null ? 400 : !"/listen".equals(r.path) ? 404 : listen ? 202 : 403));
-                    if (listen) listen();
+                    long t = r == null || !"/listen".equals(r.path) ? -1
+                            : Listening.verify(r.authorization, Reporter.get(this).token(), System.currentTimeMillis(), lastTrigger);
+                    c.getOutputStream().write(Listening.reply(r == null ? 400 : !"/listen".equals(r.path) ? 404 : t > 0 ? 202 : 403));
+                    if (t > 0) {
+                        lastTrigger = t;
+                        listen();
+                    }
                 } catch (Exception e) {
                     // one bad request: carry on
                 }
             }
         } catch (Exception e) {
-            if (server != null) status = "Couldn't wait for the watch: " + e.getClass().getSimpleName();
+            // the port is taken (another app holds it?) or closed: say so, and try again next time
+            if (server == null) status = "Couldn't wait for the watch here: " + e.getClass().getSimpleName();
+        } finally {
+            server = null;
+            serving.set(false);
         }
     }
 
     private void listen() {
         if (NowPlayingService.playing) return; // this phone's own music is followed, not heard
+        long now = System.currentTimeMillis();
+        if (now - lastRecordingAt < EVERY_MS) return;
         if (!recording.compareAndSet(false, true)) return; // already listening
+        lastRecordingAt = now;
         new Thread(() -> {
             try {
                 record();
@@ -161,6 +177,8 @@ public class ListenService extends Service {
         short[] buf = new short[Listening.PIECE];
         long startedAt = 0;
         int offset = 0;
+        java.util.List<byte[]> first = new java.util.ArrayList<>(); // the first second, held until it's known not to be silence
+        boolean heard = false;
         try {
             rec.startRecording();
             status = "Listening for the watch…";
@@ -173,12 +191,20 @@ public class ListenService extends Service {
                 }
                 if (n <= 0) break;
                 if (startedAt == 0) startedAt = firstSampleAt(rec, n);
+                heard |= Listening.rmsDb(buf, n) >= Listening.QUIET_DB;
                 final byte[] pcm = Listening.pcm(buf, n);
-                final int at = offset;
-                final long t0 = startedAt;
-                uploads.execute(() -> {
-                    if (!done.get() && upload(session, t0, at, pcm)) done.set(true);
-                });
+                final long readAt = System.currentTimeMillis();
+                if (!heard && offset + n < Listening.RATE) {
+                    first.add(pcm); // hold on: a silent room isn't worth sending
+                    offset += n;
+                    continue;
+                }
+                if (!heard) break; // a second of silence: nothing to name, nothing sent
+                int at = offset - first.size() * Listening.PIECE;
+                for (byte[] held : first) send(done, session, startedAt, at, held, readAt);
+                at += first.size() * Listening.PIECE;
+                first.clear();
+                send(done, session, startedAt, at, pcm, readAt);
                 offset += n;
             }
         } catch (RuntimeException e) {
@@ -192,6 +218,18 @@ public class ListenService extends Service {
             rec.release();
             if (status.startsWith("Listening")) status = "Ready: the watch can ask this phone to listen";
         }
+    }
+
+    /** A piece to the server, in order; one held up more than STALE_MS stops the listening. */
+    private void send(AtomicBoolean done, String session, long startedAt, int at, byte[] pcm, long readAt) {
+        uploads.execute(() -> {
+            if (done.get()) return;
+            if (System.currentTimeMillis() - readAt > STALE_MS) {
+                done.set(true); // the network is too slow for this to be about what plays now
+                return;
+            }
+            if (upload(session, startedAt, at, pcm)) done.set(true);
+        });
     }
 
     /** Music, not speech: no noise suppression or gain riding where the phone allows it. */

@@ -18,21 +18,48 @@ public class ListeningTest {
         return Listening.read(new ByteArrayInputStream(raw.getBytes(StandardCharsets.US_ASCII)));
     }
 
+    // HMAC-SHA256("abc", "lezepplean-listen:1700000000000"), from Node's crypto: what the side service sends
+    private static final String SIGNED = "LZL 1700000000000.ddc79a031bce6f8e9136005d54cd1b0cb7af180b43cc3138fd455a6824d6297d";
+
     @Test
-    public void theWatchsRequestIsReadWithItsToken() throws IOException {
-        Listening.Request r = read("POST /listen HTTP/1.1\r\nHost: 127.0.0.1:47391\r\nauthorization: Bearer abc\r\n"
+    public void theWatchsRequestIsReadWithItsSignature() throws IOException {
+        Listening.Request r = read("POST /listen HTTP/1.1\r\nHost: 127.0.0.1:47391\r\nauthorization: " + SIGNED + "\r\n"
                 + "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
         assertEquals("POST", r.method);
         assertEquals("/listen", r.path);
-        assertTrue(Listening.authorized(r.authorization, "abc"));
+        assertEquals(1700000000000L, Listening.verify(r.authorization, "abc", 1700000005000L, 0));
     }
 
     @Test
-    public void onlyTheTokenMakesItListen() throws IOException {
-        assertFalse("no token", Listening.authorized(read("POST /listen HTTP/1.1\r\n\r\n").authorization, "abc"));
-        assertFalse("the wrong one", Listening.authorized("Bearer abd", "abc"));
-        assertFalse("none set here", Listening.authorized("Bearer ", ""));
+    public void onlyAFreshSignatureMadeWithTheTokenCountsAndOnlyOnce() {
+        long now = 1700000005000L;
+        assertEquals("the token itself is never what is sent", -1, Listening.verify("Bearer abc", "abc", now, 0));
+        assertEquals("another token's signature", -1, Listening.verify(SIGNED, "abd", now, 0));
+        assertEquals("no token here", -1, Listening.verify(SIGNED, "", now, 0));
+        assertEquals("a copy, used again", -1, Listening.verify(SIGNED, "abc", now, 1700000000000L));
+        assertEquals("signed long ago", -1, Listening.verify(SIGNED, "abc", now + Listening.FRESH_MS, 0));
+        assertEquals("tampered", -1, Listening.verify(SIGNED.replace("ddc7", "ddc8"), "abc", now, 0));
+    }
+
+    @Test
+    public void javaSignsLikeTheSideService() {
+        assertEquals(SIGNED.substring(SIGNED.indexOf('.') + 1), Listening.hmacHex("abc", "lezepplean-listen:1700000000000"));
+    }
+
+    @Test
+    public void aHeadThatNeverEndsIsNotARequest() throws IOException {
+        StringBuilder b = new StringBuilder("POST /listen HTTP/1.1\r\nX: ");
+        for (int i = 0; i < 5000; i++) b.append('y');
+        assertNull(read(b.toString()));
         assertNull("not HTTP", read(""));
+    }
+
+    @Test
+    public void silenceIsQuieterThanTheGateAndMusicIsNot() {
+        assertTrue(Listening.rmsDb(new short[800], 800) < Listening.QUIET_DB);
+        short[] loud = new short[800];
+        for (int i = 0; i < loud.length; i++) loud[i] = (short) (i % 2 == 0 ? 8000 : -8000);
+        assertTrue(Listening.rmsDb(loud, loud.length) > Listening.QUIET_DB);
     }
 
     @Test

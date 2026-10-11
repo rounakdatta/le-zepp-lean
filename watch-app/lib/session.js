@@ -99,6 +99,9 @@ export function createSession() {
     holdUntil: 0, // after errors: no requests before this
     findHoldUntil: 0, // Shazam refusing calls (the server says until when): no song searches before this
     linkUp: true, // the Bluetooth link to the phone (see onLink)
+    linkDownAt: -Infinity,
+    heardId: null, // the last song news from the phone's mic, acted on once
+    heardOnly: false, // the song came from the phone's mic, and the watch's hasn't heard it yet
     resumeCheck: null, // { from, due }: confirm a resume once `due` arrives
     doubt: null, // { due, wait }: a "resume" the server couldn't place; the room is loud, the lyrics frozen
     provisional: false, // resumed on loudness alone; the server hasn't confirmed it is the song yet
@@ -138,15 +141,21 @@ export function isPlaying(s) {
   return !!s.song && clock.isKnown(s.clock) && !clock.isPaused(s.clock)
 }
 
-// The phone's player is playing: it is the clock, and nothing the mics hear changes that.
+// The phone's player is playing (or buffering: skipping, a stalled stream; still its music):
+// it is the clock, and nothing the mics hear changes that.
 export function phonePlaying(s) {
-  return s.source === 'phone' && !!s.phone && s.phone.playing
+  return s.source === 'phone' && !!s.phone && s.phone.active
 }
 
 // Nothing to follow in the room: no song yet, or only the phone's, paused. The mics look
 // for one (the watch's, and the phone's when it listens too), and what they find takes over.
 export function looking(s) {
   return !s.song || (s.source === 'phone' && !phonePlaying(s))
+}
+
+// The phone's mic is wanted: looking for a song, or following one only it has heard.
+export function wantsPhoneEars(s) {
+  return looking(s) || s.heardOnly
 }
 
 function emit(s, type, extra) {
@@ -246,6 +255,9 @@ function correlation(a, b, minN) {
 
 function onActivity(s, ev) {
   if (s.source === 'phone') return // its player paused: the room's stops and starts aren't its song's
+  // A song only the phone's mic has heard: the watch hearing quiet says nothing about it (that
+  // is why the phone's mic was needed). It used to freeze the song at the watch's first take.
+  if (s.heardOnly && ev.type === 'pause') return
   let at = packetTime(s, ev.type === 'pause' ? ev.packet - PAUSE_TAIL_PACKETS : ev.packet)
   if (ev.type === 'pause' && ev.packet === s.gapTo + 1) {
     // The quiet began between two takes: somewhere between the last packet heard and this
@@ -300,7 +312,7 @@ function onActivity(s, ev) {
 // ---- input: time ------------------------------------------------------------------
 
 export function onTick(s, now) {
-  if (s.source === 'phone' && s.phone && !s.phone.playing && now - s.phone.pausedSince >= PHONE_IDLE_MS) leavePhone(s)
+  if (s.source === 'phone' && s.phone && !s.phone.active && now - s.phone.pausedSince >= PHONE_IDLE_MS) leavePhone(s)
   // The watch's clock ends a song only when the room is the clock. The phone says itself when
   // its track ends, or stops (a helper gone quiet is marked paused by the server); ended here,
   // the song left the watch in earphones mode with nothing to follow and the mic off.
@@ -321,6 +333,7 @@ function endSong(s) {
   s.comeback = null
   s.doubt = null
   s.check = null
+  s.heardOnly = false
   s.nextLyricsAt = Infinity
   s.nextIdentifyPacket = s.last + 1
 }
@@ -338,6 +351,9 @@ function request(s, kind, purpose, from, to, now, startAtOverride) {
   if (from >= 0 && startAtOverride === undefined) from = Math.max(from, to - MAX_WINDOW_PACKETS + 1)
   s.seq += 1
   const startAt = startAtOverride !== undefined ? startAtOverride : from >= 0 ? packetTime(s, from) : null
+  // A search is about whatever plays, not the song on screen (a paused phone song: its lyrics,
+  // marked known, were left out of the answer when the room played that same song).
+  const about = purpose === 'find' ? null : s.song
   const req = {
     id: s.seq,
     kind, // 'identify' (audio) | 'lyrics' (no audio)
@@ -345,9 +361,9 @@ function request(s, kind, purpose, from, to, now, startAtOverride) {
     from,
     to, // packets [from, to] inclusive
     startAt,
-    expectMs: s.song && startAt !== null ? clock.songAt(s.clock, startAt) : null,
-    song: s.song ? s.song.id : null,
-    known: s.song ? { lyrics: s.song.lyricsVersion || null, envelope: s.song.envelope ? s.song.envelope.version : null } : null,
+    expectMs: about && startAt !== null ? clock.songAt(s.clock, startAt) : null,
+    song: about ? about.id : null,
+    known: about ? { lyrics: about.lyricsVersion || null, envelope: about.envelope ? about.envelope.version : null } : null,
     sentAt: now,
   }
   s.inflight = req
@@ -527,13 +543,18 @@ export function onPhone(s, view, now) {
 function onHeard(s, h, now) {
   if (!h.id || !h.songId || h.id === s.heardId) return
   s.heardId = h.id
-  if (!looking(s)) return
+  if (s.heardOnly && s.song && s.song.id === h.songId) {
+    clock.addMatch(s.clock, now, h.positionMs) // the phone's ears again: where the song is now
+    return
+  }
+  if (!looking(s) && !s.heardOnly) return
   if (s.source === 'phone') leavePhone(s)
   const song = { id: h.songId, title: h.title, artist: h.artist, durationMs: h.durationMs }
   startSong(s, { song, match: { offsetMs: h.positionMs, skew: 0 } }, { startAt: now, from: s.last + 1 }, now)
   s.song.kind = 'pending' // its lyrics are asked for at once
   s.nextLyricsAt = now
   s.nextVerifyAt = now + VERIFY_STEPS_MS[0]
+  s.heardOnly = true // until the watch's own mic places it
 }
 
 function followPlayer(s, view, now) {
@@ -541,9 +562,10 @@ function followPlayer(s, view, now) {
   if (s.phone && view.version === s.phone.version && view.title === s.phone.title) return s.source === 'phone'
   const track = view.title ? view.title + '\u0000' + (view.artist || '') : ''
   const prev = s.phone
-  const pausedSince = view.playing ? null : prev && prev.track === track && prev.pausedSince !== null ? prev.pausedSince : now
-  s.phone = { version: view.version, title: view.title, track, playing: !!view.playing, pausedSince }
-  const follow = !!track && (view.playing || (s.source === 'phone' && now - pausedSince < PHONE_IDLE_MS))
+  const active = view.active !== undefined ? !!view.active : !!view.playing // buffering is still its music
+  const pausedSince = active ? null : prev && prev.track === track && prev.pausedSince !== null ? prev.pausedSince : now
+  s.phone = { version: view.version, title: view.title, track, playing: !!view.playing, active, pausedSince }
+  const follow = !!track && (active || (s.source === 'phone' && now - pausedSince < PHONE_IDLE_MS))
   if (!follow) {
     if (s.source === 'phone') leavePhone(s)
     return false
@@ -610,9 +632,19 @@ export function onLink(s, up, now) {
   if (up === s.linkUp) return null
   s.linkUp = up
   emit(s, up ? 'link_up' : 'link_down')
-  if (!up) return null
+  if (!up) {
+    s.linkDownAt = now
+    return null
+  }
   s.errors = 0
   s.holdUntil = 0
+  // A request out when the link dropped is lost (ZML never rejects it: it would time out 25 s
+  // later and hold everything up meanwhile). Let it go; a lyrics poll is made again.
+  if (s.inflight && s.inflight.sentAt <= s.linkDownAt) {
+    s.inflight.lost = true
+    if (s.inflight.kind === 'lyrics') s.nextLyricsAt = Math.min(s.nextLyricsAt, now)
+    s.inflight = null
+  }
   return decide(s, now)
 }
 
@@ -703,6 +735,7 @@ export function onResponse(s, req, res, now) {
   // earphones started, replaced the song playing in them).
   if (phonePlaying(s) && req.kind === 'identify') return
   res = res || {}
+  if (req.lost && !res.ok) return // given up on when the link dropped: its failure means nothing now
   if (res.reason === 'no_server') {
     s.noServer = true
     emit(s, 'no_server')
@@ -778,6 +811,7 @@ export function onResponse(s, req, res, now) {
       s.retries = 0
       s.comeback = null // placed, whoever asked (left behind, it stopped every later re-sync)
     }
+    s.heardOnly = false // the watch's own mic has the song now
     mergeSongData(s, res, now)
   }
   s.misses = 0
@@ -879,6 +913,7 @@ function startSong(s, res, req, now) {
   s.resumeCheck = null
   s.comeback = null
   s.doubt = null
+  s.heardOnly = false
   s.provisional = false
   s.retries = 0
   s.quietAt = null
@@ -893,6 +928,8 @@ function startSong(s, res, req, now) {
 // Lyrics, word status and the loudness track, each only when the server sent a new version.
 function mergeSongData(s, res, now) {
   const song = s.song
+  // its length, if it wasn't known when the song started (a song the phone's mic named first)
+  if (res.song && res.song.durationMs && !song.durationMs) song.durationMs = res.song.durationMs
   if (res.lyrics && res.lyrics.version !== song.lyricsVersion) {
     song.kind = res.lyrics.kind || 'none'
     song.lines = normalizeLines(res.lyrics.lines || [])

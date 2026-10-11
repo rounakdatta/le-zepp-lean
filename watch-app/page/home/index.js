@@ -187,7 +187,7 @@ function askPhone() {
   phoneTimer = setTimeout(guard('askPhone', askPhone), PHONE_ASK_MS)
   const sentAt = Date.now()
   page
-    .request({ method: 'phone', params: { listen: session.looking(s) } }, { timeout: 8000 })
+    .request({ method: 'phone', params: { listen: session.wantsPhoneEars(s) } }, { timeout: 8000 })
     .then(guard('phoneAnswer', (view) => {
       const trip = Date.now() - sentAt
       if (trip < 2000) bleOneWayMs = Math.round(bleOneWayMs * 0.7 + (trip / 2) * 0.3)
@@ -325,7 +325,8 @@ function onTake(take) {
     if (!s.song && s.takeSkip === 'quiet') view.showMessage('Listening…', 'Waiting for the music')
     return
   }
-  if (req.purpose === 'find') view.showMessage('Identifying…', 'Checking what it just heard')
+  // (not over a paused phone song: it stays up while the mics look)
+  if (req.purpose === 'find' && !s.song) view.showMessage('Identifying…', 'Checking what it just heard')
   send(req, windowBytes(stream, req.from - base, req.to - base + 1).bytes.buffer)
 }
 

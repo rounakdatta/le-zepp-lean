@@ -5,6 +5,7 @@
 // exactly, with no mic at all.
 import { BaseSideService, settingsLib } from '@zeppos/zml/base-side'
 import { DEFAULT_SERVER_URL, DEFAULT_TOKEN } from './defaults'
+import { listenAuthorization } from './sign'
 
 // The phone's HTTP client is reported to drop requests after ~10 s of silence, so answer
 // well before that; the server itself gives the recognizer at most 6 s.
@@ -112,7 +113,8 @@ function phoneNow() {
 
 // The watch is looking for a song: the LeZeppLean helper on this phone listens too (its mic
 // is better than the watch's), if it is set up to. Asked on the phone itself, so it costs
-// nothing when it isn't; at most every 30 s while the watch keeps looking.
+// nothing when it isn't; at most every 30 s while the watch keeps looking. The request is
+// signed with the token, never carries it: whatever holds that port is told nothing.
 const HELPER_URL = 'http://127.0.0.1:47391/listen'
 const LISTEN_EVERY_MS = 30000
 let listenedAt = 0
@@ -121,8 +123,11 @@ function listenOnPhone() {
   if (Date.now() - listenedAt < LISTEN_EVERY_MS) return
   listenedAt = Date.now()
   const { token } = config()
+  if (!token) return // nothing to sign with: the helper wouldn't listen anyway
+  const now = Date.now()
+  const h = { 'Content-Type': 'application/json', Authorization: listenAuthorization(token, now) }
   // its answer is only logged: the watch's own search goes on either way
-  fetch({ url: HELPER_URL, method: 'POST', headers: headers(token, true), body: '{}', timeout: 1500 })
+  fetch({ url: HELPER_URL, method: 'POST', headers: h, body: '{}', timeout: 1500 })
     .then((res) => console.log('lezepplean: phone mic asked, helper answered ' + res.status))
     .catch((e) => console.log('lezepplean: phone mic not reached: ' + ((e && e.message) || e)))
 }

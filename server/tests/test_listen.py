@@ -44,7 +44,7 @@ def test_what_the_phone_hears_is_named_and_the_watch_gets_the_song_where_it_is_n
     client, app_module, _ = api
     asked = []
 
-    async def recognize(wav):
+    async def recognize(wav, **_kw):
         asked.append(len(wav))
         return match(30_000)
 
@@ -67,7 +67,7 @@ def test_not_named_from_the_first_seconds_it_is_asked_again_with_more(api, monke
     client, app_module, _ = api
     answers = [None, match()]
 
-    async def recognize(_wav):
+    async def recognize(_wav, **_kw):
         return answers.pop(0)
 
     monkeypatch.setattr(app_module._recognizer, "recognize", recognize)
@@ -83,7 +83,7 @@ def test_while_the_phone_plays_music_its_mic_is_never_used(api, monkeypatch):
     client, app_module, _ = api
     asked = []
 
-    async def recognize(_wav):
+    async def recognize(_wav, **_kw):
         asked.append(1)
         return match()
 
@@ -100,7 +100,7 @@ def test_shazam_refusing_ends_the_listening_after_one_try(api, monkeypatch):
     client, app_module, _ = api
     asked = []
 
-    async def busy(_wav):
+    async def busy(_wav, **_kw):
         asked.append(1)
         raise RecognizerBusy(30)
 
@@ -128,7 +128,7 @@ def test_a_piece_sent_twice_or_lost_never_shifts_the_timing():
 def test_the_watch_hears_of_it_the_moment_it_is_named(api, monkeypatch):
     client, app_module, _ = api
 
-    async def recognize(_wav):
+    async def recognize(_wav, **_kw):
         return match()
 
     monkeypatch.setattr(app_module._recognizer, "recognize", recognize)
@@ -153,7 +153,7 @@ def test_silence_is_not_asked_about(api, monkeypatch):
     client, app_module, _ = api
     asked = []
 
-    async def recognize(_wav):
+    async def recognize(_wav, **_kw):
         asked.append(1)
         return match()
 
@@ -164,3 +164,54 @@ def test_silence_is_not_asked_about(api, monkeypatch):
         client.post("/listen/audio", json={"session": "q", "startedAt": started, "offset": i * HALF_S, "pcm": quiet})
     time.sleep(0.3)
     assert asked == [], "no Shazam call spent on a silent room"
+
+
+def test_a_piece_claiming_a_far_offset_never_grows_the_recording():
+    r = listen.Listening("r", 0.0)
+    r.put(25_000_000, b"\x01\x00" * 10)  # used to zero-fill 50 MB up to it
+    assert len(r.pcm) == 0
+    r.put(0, b"\x01\x00" * 10 + b"\x07")  # an odd byte: never half a sample
+    assert len(r.pcm) == 20
+    r.put(listen.LIMIT // 2 - 4, b"\x02\x00" * 100)  # runs past the limit: cut at it
+    assert len(r.pcm) == listen.LIMIT
+
+
+def test_audio_held_up_until_it_is_old_is_not_named_as_playing_now(api, monkeypatch):
+    client, app_module, _ = api
+    asked = []
+
+    async def recognize(_wav, **_kw):
+        asked.append(1)
+        return match()
+
+    monkeypatch.setattr(app_module._recognizer, "recognize", recognize)
+    long_ago = time.time() * 1000 - (listen.MAX_AGE_S + 5) * 1000
+    replies = stream(client, 6, long_ago)
+    assert replies[0]["done"] and replies[0]["reason"] == "stale"
+    time.sleep(0.2)
+    assert asked == []
+
+
+def test_while_shazam_refuses_the_phone_is_told_to_stop_at_its_first_piece(api, monkeypatch):
+    client, app_module, _ = api
+    monkeypatch.setattr(app_module._recognizer, "cooling", lambda: 42.0)
+    reply = stream(client, 1, time.time() * 1000)[0]
+    assert reply["done"] and reply["reason"] == "busy"
+
+
+def test_a_phone_buffering_is_still_the_phones_music(api, monkeypatch):
+    client, app_module, _ = api
+    asked = []
+
+    async def recognize(_wav, **_kw):
+        asked.append(1)
+        return match()
+
+    monkeypatch.setattr(app_module._recognizer, "recognize", recognize)
+    client.post("/phone", json={"app": "com.spotify.music", "title": "Other", "artist": "X", "state": "buffering",
+                                "positionMs": 1000, "sentAt": time.time() * 1000})
+    view = client.get("/phone/next?since=-1&wait=0").json()
+    assert view["active"] is True and view["playing"] is False
+    replies = stream(client, 6, time.time() * 1000)
+    assert replies[0]["done"] and replies[0]["reason"] == "phone_playing"
+    assert asked == []

@@ -7,7 +7,20 @@ import { register } from 'node:module'
 register('../render/hooks.mjs', import.meta.url)
 const ui = await import('../render/zos-ui.mjs')
 const { errors } = await import('../render/zos-utils.mjs')
-const { mic, ble } = await import('../render/zos-stubs.mjs')
+const { mic, ble, files } = await import('../render/zos-stubs.mjs')
+const { readFileSync } = await import('node:fs')
+
+// A take of real watch packets (tests/fixtures), all as loud as music: what the recorder hands over.
+const FIXTURE = JSON.parse(readFileSync(new URL('../fixtures/silk-packets.json', import.meta.url)))
+function loudTake(n) {
+  const p = Buffer.from(FIXTURE.packets[40], 'base64')
+  const out = Buffer.alloc(n * (8 + p.length))
+  for (let i = 0; i < n; i++) {
+    out.writeUInt32BE(p.length, i * (8 + p.length))
+    p.copy(out, i * (8 + p.length) + 8)
+  }
+  return out.buffer.slice(out.byteOffset, out.byteOffset + out.length)
+}
 
 const SONG = { title: 'Wonderwall', artist: 'Oasis', durationMs: 258_000, speed: 1, songId: 'wonderwall' }
 const SYNCED = { ok: true, song: { id: 'wonderwall' }, lyrics: { version: 'v1', kind: 'synced', lines: [[500, 'Today is gonna be the day', null, null]] }, words: { status: 'ready' } }
@@ -143,4 +156,28 @@ test('opened with the phone out of reach, the watch says so, and asks the phone 
   await run(300)
   assert.ok(asked.filter((m) => m === 'phone').length > before, 'the phone is asked at once, not at the next 20 s turn')
   assert.ok(!page.screen().includes('Waiting for your phone'))
+})
+
+test('the phone paused in a loud room: its song stays up while the mics look, through a miss', async (t) => {
+  let now = { version: -1, title: '' }
+  const asked = []
+  const page = await openPage(t, (method, params) => {
+    asked.push(method + (params && params.purpose ? ':' + params.purpose : ''))
+    if (method === 'lyrics') return Promise.resolve(SYNCED)
+    if (method === 'identify') return Promise.resolve({ ok: false, reason: 'no_match' })
+    return Promise.resolve(now)
+  })
+  t.after(() => {
+    files.take = null
+  })
+  const phone = (v) => page.onCall({ method: 'phone', params: (now = { ...SONG, ...v }) })
+  phone({ version: 4, playing: true, positionMs: 1000 })
+  await run(3000)
+  files.take = loudTake(55)
+  phone({ version: 5, playing: false, positionMs: 4000 })
+  await run(12_000)
+  assert.ok(asked.includes('identify:find'), 'the mics looked: ' + asked.join(', '))
+  const screen = page.screen().join(' | ')
+  assert.ok(!/Identifying|Listening/.test(screen), screen)
+  assert.ok(/Wonderwall|Today is gonna be the day/.test(screen), screen)
 })

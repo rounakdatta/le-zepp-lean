@@ -19,6 +19,8 @@ RATE = 16_000
 ASK_AT_S = (2.5, 4.0, 6.0)  # seconds of audio at which Shazam is asked (within its budget)
 MAX_S = 8.0                 # the helper stops listening after this much
 KEEP_S = 60.0               # a recording nothing has been added to for this long is forgotten
+MAX_AGE_S = MAX_S + 20      # audio that began longer ago than this is too old to name as playing now
+LIMIT = int((MAX_S + 2) * RATE) * 2  # bytes: no recording grows past this, whatever a piece claims
 QUIET_DB = -55.0            # quieter than this (RMS, dBFS) is no music to name: no Shazam call spent on it
 
 
@@ -38,10 +40,12 @@ class Listening:
         return len(self.pcm) / 2 / RATE
 
     def put(self, offset: int, data: bytes) -> None:
-        """16-bit samples from `offset` (counted from the recording's first) on."""
-        limit = int((MAX_S + 2) * RATE) * 2
-        a = max(0, offset) * 2
-        data = data[: max(0, limit - a) // 2 * 2]
+        """16-bit samples from `offset` (counted from the recording's first) on. Nothing past
+        LIMIT: a piece claiming a far offset used to zero-fill the buffer up to it."""
+        a = offset * 2
+        if offset < 0 or a >= LIMIT:
+            return
+        data = data[: min(len(data), LIMIT - a) // 2 * 2]  # whole samples only
         if a > len(self.pcm):
             self.pcm.extend(bytes(a - len(self.pcm)))
         self.pcm[a: a + len(data)] = data

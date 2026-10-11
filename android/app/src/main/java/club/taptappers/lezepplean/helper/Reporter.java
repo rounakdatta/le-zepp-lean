@@ -67,13 +67,11 @@ final class Reporter {
         io.execute(this::drain);
     }
 
-    /** The network is back: whatever couldn't be delivered goes now. */
+    /** The network is back: whatever couldn't be delivered goes now (unless something newer has). */
     void networkBack() {
-        Snapshot again;
         synchronized (this) {
-            again = failed;
+            if (failed != null) send(failed); // under the lock: a newer state can't slip in between and be overwritten
         }
-        if (again != null) send(again);
     }
 
     private void drain() {

@@ -41,6 +41,7 @@ public class MainActivity extends Activity {
     private TextView status;
     private Button listenSwitch;
     private TextView listenStatus;
+    private boolean micRefused;
     private Reporter reporter;
 
     private final Runnable refresh = new Runnable() {
@@ -159,11 +160,10 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(code, permissions, results);
-        if (code == 1 && micAllowed()) {
+        micRefused = code == 1 && !micAllowed();
+        if (code == 1 && !micRefused) {
             reporter.prefs.edit().putBoolean("listen", true).apply();
             ListenService.start(this);
-        } else if (code == 1) {
-            ListenService.status = "The microphone wasn't allowed";
         }
         show();
     }
@@ -180,7 +180,9 @@ public class MainActivity extends Activity {
         accessHint.setVisibility(ok ? View.GONE : View.VISIBLE);
         allow.setVisibility(ok ? View.GONE : View.VISIBLE);
         listenSwitch.setText(listening() ? "Turn off" : "Turn on");
-        listenStatus.setText(listening() ? ListenService.status : "Off");
+        listenStatus.setText(listening() ? ListenService.status
+                : micRefused ? "The microphone wasn't allowed. To change that: Settings → Apps → LeZeppLean → Permissions → Microphone."
+                : "Off");
         long ago = reporter.lastAt == 0 ? -1 : (System.currentTimeMillis() - reporter.lastAt) / 1000;
         status.setText(reporter.lastResult + (ago < 0 ? "" : ago < 2 ? " (just now)" : " (" + ago + " s ago)"));
     }

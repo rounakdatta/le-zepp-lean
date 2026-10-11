@@ -1,9 +1,8 @@
 package club.taptappers.lezepplean.helper;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
@@ -11,11 +10,17 @@ import java.util.Locale;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
 /** The plain-Java parts of listening (ListenService): tested on the JVM. */
 final class Listening {
     static final int RATE = 16_000;
     static final int PIECE = RATE / 2; // samples: half a second
     static final int MAX_SAMPLES = RATE * 8; // the server has named it by then, or won't
+    static final double QUIET_DB = -55; // quieter than this is no music: nothing to send (the server's gate too)
+    static final long FRESH_MS = 60_000; // a trigger signed longer ago than this is refused
+    private static final int HEAD_LIMIT = 4096; // a request head longer than this isn't the side service's
 
     private Listening() {}
 
@@ -32,41 +37,89 @@ final class Listening {
         }
     }
 
-    /** Reads an HTTP request's head (and skips its small body). Null if it isn't one. */
-    static Request read(InputStream in) throws IOException {
-        BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.US_ASCII), 4096);
-        String line = r.readLine();
-        if (line == null) return null;
-        String[] parts = line.trim().split(" ");
+    /** Reads an HTTP request's head, at most HEAD_LIMIT bytes (and skips its small body). Null if it isn't one. */
+    static Request read(InputStream raw) throws IOException {
+        InputStream in = new BufferedInputStream(raw, 512);
+        byte[] head = new byte[HEAD_LIMIT];
+        int n = 0;
+        boolean ended = false;
+        while (n < head.length) {
+            int b = in.read();
+            if (b < 0) break;
+            head[n++] = (byte) b;
+            if (n >= 4 && head[n - 4] == '\r' && head[n - 3] == '\n' && head[n - 2] == '\r' && head[n - 1] == '\n') {
+                ended = true;
+                break;
+            }
+        }
+        if (!ended) return null;
+        String[] lines = new String(head, 0, n, StandardCharsets.US_ASCII).split("\r\n");
+        String[] parts = lines[0].trim().split(" ");
         if (parts.length < 2) return null;
         String auth = null;
         int length = 0;
-        for (int i = 0; i < 64; i++) {
-            String h = r.readLine();
-            if (h == null || h.isEmpty()) break;
-            int c = h.indexOf(':');
+        for (int i = 1; i < lines.length; i++) {
+            int c = lines[i].indexOf(':');
             if (c <= 0) continue;
-            String name = h.substring(0, c).trim().toLowerCase(Locale.ROOT);
-            String value = h.substring(c + 1).trim();
+            String name = lines[i].substring(0, c).trim().toLowerCase(Locale.ROOT);
+            String value = lines[i].substring(c + 1).trim();
             if (name.equals("authorization")) auth = value;
             if (name.equals("content-length")) {
                 try {
-                    length = Math.min(4096, Math.max(0, Integer.parseInt(value)));
+                    length = Math.min(HEAD_LIMIT, Math.max(0, Integer.parseInt(value)));
                 } catch (NumberFormatException e) {
                     length = 0;
                 }
             }
         }
-        for (int i = 0; i < length && r.read() >= 0; i++) {
+        for (int i = 0; i < length && in.read() >= 0; i++) {
             // the body ({}) says nothing: read so the sender isn't cut off mid-write
         }
         return new Request(parts[0], parts[1], auth);
     }
 
-    /** Only the Zepp app's side service knows the token: other apps on this phone can't make it listen. */
-    static boolean authorized(String header, String token) {
-        if (token == null || token.isEmpty() || header == null) return false;
-        return MessageDigest.isEqual(header.getBytes(StandardCharsets.UTF_8), ("Bearer " + token).getBytes(StandardCharsets.UTF_8));
+    /**
+     * A trigger from the Zepp app's side service: "LZL <ms>.<hex HMAC-SHA256(token, lezepplean-listen:<ms>)>".
+     * The token itself never comes here (any app holding the port would have had it). Fresh
+     * (within FRESH_MS of now) and newer than the last one taken: a copy can't be used again.
+     * Returns its time, or -1.
+     */
+    static long verify(String header, String token, long now, long lastTaken) {
+        if (token == null || token.isEmpty() || header == null || !header.startsWith("LZL ")) return -1;
+        int dot = header.indexOf('.', 4);
+        if (dot < 0) return -1;
+        long t;
+        try {
+            t = Long.parseLong(header.substring(4, dot).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+        if (t <= lastTaken || Math.abs(now - t) > FRESH_MS) return -1;
+        String expected = hmacHex(token, "lezepplean-listen:" + t);
+        boolean same = MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
+                header.substring(dot + 1).trim().toLowerCase(Locale.ROOT).getBytes(StandardCharsets.US_ASCII));
+        return same ? t : -1;
+    }
+
+    static String hmacHex(String key, String message) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            StringBuilder out = new StringBuilder();
+            for (byte b : mac.doFinal(message.getBytes(StandardCharsets.UTF_8))) out.append(String.format(Locale.ROOT, "%02x", b));
+            return out.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** RMS level of n samples, in dBFS. */
+    static double rmsDb(short[] samples, int n) {
+        if (n <= 0) return -120;
+        double sum = 0;
+        for (int i = 0; i < n; i++) sum += (double) samples[i] * samples[i];
+        double rms = Math.sqrt(sum / n);
+        return rms <= 0 ? -120 : 20 * Math.log10(rms / 32768.0);
     }
 
     static byte[] reply(int code) {

@@ -94,7 +94,7 @@ _http = httpx.AsyncClient(follow_redirects=True)
 _recognizer = Recognizer()
 _lyrics = LyricsFinder(_http)
 _store = SongStore(DATA / "songs")
-_preparer = Preparer(_store, _recognizer.recognize, threads=THREADS)
+_preparer = Preparer(_store, lambda wav: _recognizer.recognize(wav, wait=True), threads=THREADS)
 _phone = phone.Phone()
 _listening = listen.Recordings()
 _recent: deque[dict] = deque(maxlen=30)
@@ -505,11 +505,17 @@ async def listen_audio(req: ListenChunk, authorization: str | None = Header(None
     _check_token(authorization)
     if req.rate != listen.RATE:
         raise HTTPException(status_code=422, detail=f"{listen.RATE} Hz only")
+    if req.offset < 0:
+        raise HTTPException(status_code=422, detail="offset < 0")
     t = time.time()
     rec = _listening.get(req.session[:64], (req.startedAt + _phone.clock(req.sentAt, t)) / 1000, t)
     _phone.expire(t)
-    if not rec.done and _phone.now.playing:
+    if not rec.done and (_phone.now.playing or _phone.now.buffering):
         rec.finish("phone_playing")  # the phone's own player comes first: it is followed, not heard
+    if not rec.done and _recognizer.cooling():
+        rec.finish("busy")  # Shazam is refusing calls: no point sending more
+    if not rec.done and t - rec.start_at > listen.MAX_AGE_S:
+        rec.finish("stale")  # held up somewhere: too old to name as what plays now
     if not rec.done:
         rec.put(req.offset, base64.b64decode(req.pcm))
         if rec.due():
@@ -521,13 +527,13 @@ async def listen_audio(req: ListenChunk, authorization: str | None = Header(None
 async def _hear(rec: listen.Listening) -> None:
     """Ask Shazam about what the phone has heard so far. Named: the watch hears of it at once."""
     found = None
-    pcm = bytes(rec.pcm)
-    level = _level_dbfs(pcm)["rmsDb"]
     try:
+        pcm = bytes(rec.pcm)
+        level = _level_dbfs(pcm)["rmsDb"]
         if level is not None and level < listen.QUIET_DB:
             log.info("listening %s: quiet (%.0f dBFS), Shazam not asked", rec.id, level)
         else:
-            found = await asyncio.wait_for(_recognizer.recognize(zepp_opus.pcm_to_wav(pcm)), RECOGNIZE_TIMEOUT_S)
+            found = await asyncio.wait_for(_recognizer.recognize(zepp_opus.pcm_to_wav(pcm), wait=True), RECOGNIZE_TIMEOUT_S)
     except RecognizerBusy:
         rec.finish("busy")  # Shazam is refusing calls: asking again with more audio won't help
     except Exception as e:  # noqa: BLE001  a timeout, or ShazamIO failing: maybe with more audio

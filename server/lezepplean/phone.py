@@ -33,6 +33,7 @@ class Snapshot:
     album: str | None = None
     duration_ms: int | None = None
     playing: bool = False
+    buffering: bool = False   # skipping, or the stream stalled: still this player's music, just no sound yet
     position_ms: float = 0.0  # where the track was at server time `at`
     at: float = 0.0           # time.time()
     speed: float = 1.0
@@ -72,9 +73,9 @@ class Phone:
         version, so that the watch hears of it (only the view used to say so, and the watch,
         seeing no new version, followed the old one for good)."""
         s = self.now
-        if s.playing and t - s.updated > STALE_S:
+        if (s.playing or s.buffering) and t - s.updated > STALE_S:
             at = s.updated + STALE_S
-            s.position_ms, s.at, s.playing = self.position(at), at, False
+            s.position_ms, s.at, s.playing, s.buffering = self.position(at), at, False, False
             self.bump()
 
     def update(self, body: dict, received: float) -> bool:
@@ -89,16 +90,18 @@ class Phone:
         duration = body.get("durationMs")
         duration = int(duration) if isinstance(duration, (int, float)) and duration > 0 else None
         playing = body.get("state") == "playing"
+        buffering = body.get("state") == "buffering"
         speed = float(body.get("speed") or 1.0) or 1.0
         position = float(body.get("positionMs") or 0.0) + (late_ms * speed if playing else 0.0)
         track = (app, name_key(title), name_key(artist), round(duration / 1000) if duration else None)
         s = self.now
         new_track = track != s.track
         moved = abs(position - self.position(received)) > 250
-        changed = new_track or playing != s.playing or (playing and moved) or (not playing and abs(position - s.position_ms) > 250)
+        changed = (new_track or playing != s.playing or buffering != s.buffering or (playing and moved)
+                   or (not playing and abs(position - s.position_ms) > 250))
         s.app, s.title, s.artist, s.album = app, title, artist, (body.get("album") or None)
         s.duration_ms = duration
-        s.playing, s.speed, s.position_ms, s.at, s.updated = playing, speed, position, received, received
+        s.playing, s.buffering, s.speed, s.position_ms, s.at, s.updated = playing, buffering, speed, position, received, received
         if new_track:
             s.track = track
             s.song_id = None
@@ -117,7 +120,7 @@ class Phone:
         self.expire(now())
         if self.now.version != since:
             return self.now
-        if self.now.playing:
+        if self.now.playing or self.now.buffering:
             timeout = min(timeout, max(0.0, self.now.updated + STALE_S - now()) + 0.01)
         changed = self._changed
         try:
@@ -138,6 +141,7 @@ class Phone:
             "artist": s.artist,
             "durationMs": s.duration_ms,
             "playing": s.playing,
+            "active": s.playing or s.buffering,  # the player's music, sounding or about to: it comes first
             "positionMs": round(self.position(t)),
             "speed": s.speed,
             "songId": s.song_id,
