@@ -1060,3 +1060,25 @@ test("silence reported during a quiet part of the song (its own loudness track s
   session.onPhone(s, { version: 5, title: '', playing: false, heard: { id: 'r3', quiet: true } }, 25_000) // at 75 s: loud part
   assert.ok(clock.isPaused(s.clock), 'quiet where the song is loud: stopped')
 })
+
+// ---- the phone's helper gone quiet (Android holding it back with the screen off) ----
+
+test("the phone's helper gone quiet doesn't stop the lyrics: its music is taken to play on", () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, positionMs: 30_000 })
+  onPhone(s, 40_000, { version: 2, positionMs: 70_000, stale: true }) // the server: no word for 35 s
+  assert.ok(!clock.isPaused(s.clock), 'still running (YouTube Music played on, the lyrics froze)')
+  assert.equal(Math.round(session.position(s, 50_000)), 80_000)
+  assert.ok(session.phonePlaying(s), 'and still the phone first: no mic')
+})
+
+test('a song from a phone gone quiet is let go at its end, and the room listened to', () => {
+  const s = session.createSession()
+  onPhone(s, 0, { version: 1, positionMs: 230_000 })
+  onPhone(s, 35_000, { version: 2, positionMs: 250_000, stale: true }) // 8 s before the end, no word since
+  session.onTick(s, 40_000)
+  assert.equal(s.source, 'phone')
+  session.onTick(s, 52_000) // past the end, with its grace
+  assert.equal(s.source, 'room')
+  assert.ok(session.looking(s))
+})
