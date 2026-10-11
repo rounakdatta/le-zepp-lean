@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 STALE_S = 35.0  # no word from the helper this long while "playing" (it heartbeats every 10 s): don't trust it
 OFFSET_SAMPLES = 40
 HEARD_FRESH_S = 20.0  # what the phone's mic named (listen.py) is offered to the watch this long
+SILENT_MAX_S = 300.0  # a phone silent this long is no longer taken to play on (as on the watch)
 
 
 @dataclass
@@ -51,6 +52,19 @@ class Phone:
         self.heard: dict | None = None
         self.heard_at = 0.0
         self.history: deque[dict] = deque(maxlen=60)  # what the helper said lately (GET /phone/recent)
+
+    def music_playing(self, t: float) -> bool:
+        """The phone's own player is playing a track: its music comes first, and isn't listened to.
+        Not a session with no track (an idle Spotify said "buffering", no title, at 0: the phone's
+        mic was turned away), nor buffering gone quiet (no word comes while buffering), nor a
+        phone silent for minutes."""
+        s = self.now
+        if not s.title:
+            return False
+        silent = t - s.updated
+        if s.buffering and not s.playing:
+            return silent <= STALE_S
+        return s.playing and silent <= SILENT_MAX_S
 
     def clock(self, sent_ms, received: float) -> float:
         """Add this to a time on the phone's clock (ms) for the server's. The fastest delivery

@@ -323,3 +323,37 @@ def test_a_refresh_while_lrclib_is_down_keeps_the_lyrics_there_are(api, monkeypa
     r = client.post("/lyrics", json={"song": "k1"}).json()
     assert r["lyrics"]["kind"] == "synced", "an outage swapped the lyrics for none, mid-song"
     assert app_module._store.get("k1").lyrics_retry_at > time.time() + 60, "and LRCLIB is asked again later"
+
+
+def test_a_length_the_song_outlasts_is_dropped_and_its_audio_looked_for_again(api, monkeypatch):
+    """A bad catalog entry gave "Nobody" 4 s: the watch ended it each time it was found, and no
+    copy of that length was ever found to time its words."""
+    client, app_module, calls = api
+
+    async def itunes(_id):
+        return 4.0, True
+
+    async def find(*_a):
+        return Lyrics(kind="synced", lines=[(1000, "Hello world"), (180_000, "Good night")], source="lrclib", source_id=7, duration_s=212.0)
+
+    monkeypatch.setattr(app_module._lyrics, "itunes_lookup", itunes)
+    monkeypatch.setattr(app_module._lyrics, "find", find)
+    r = client.post("/identify", json={"audio": watch_file(music(5)), "purpose": "find"}).json()
+    song = app_module._store.get("k1")
+    assert song.duration_ms == 212_000, "the lyrics run to 3 min: LRCLIB's length, which can be right"
+    assert r["song"]["durationMs"] == 212_000
+
+
+def test_heard_past_its_length_the_length_is_dropped(api):
+    import time
+
+    client, app_module, _ = api
+    from lezepplean.songs import Song
+    app_module._store.put(Song(id="k1", title="Song", artist="Band", apple_id="1", shazam_key="k1", lyrics_kind="synced",
+                               lrc=[[1000, "Hello world"]], duration_ms=40_000, length_checked=True, reference_status="unavailable",
+                               reference_retry_at=time.time() + 3600))
+    r = client.post("/identify", json={"audio": watch_file(music(5)), "purpose": "find"}).json()  # Shazam: 30 s in, fine
+    assert r["song"]["durationMs"] == 40_000
+    song = app_module._store.get("k1")
+    assert app_module._check_length(song, 95_000), "heard 95 s into a '40 s' song"
+    assert song.duration_ms is None and song.reference_retry_at == 0.0, "and its audio is looked for again"
