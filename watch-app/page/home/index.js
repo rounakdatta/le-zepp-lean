@@ -47,10 +47,11 @@ const HINT_MS = 8000 // the key hint shows when the first lyrics do, then gets o
 const FIND_TAKE_MS = 3500 // what Shazam needs to name a song (see session.FIND_TAKE_PACKETS)
 const PLACE_TAKE_MS = 3000 // ~2.7 s of audio: enough to place inside a song the server knows
 const FOLLOW_TAKE_MS = 2000
-// Between one take's end and the next start(). Some watches lock the mic when it restarts
-// too soon; a T-Rex 3 (firmware 6.4.16.3) took 20 takes in a row with this gap, each a full
-// 28 packets, none empty (10 Oct 2026).
-const TAKE_GAP_MS = 250
+// From one take's stop() to the next start(). Some watches lock the mic when it restarts too
+// soon (forum #556). On a T-Rex 3 (firmware 6.4.16.3) every take came out whole with ~630 ms
+// or more between them (10-11 Oct 2026: 250 ms after the ~310 ms the file took to be handed
+// over, plus the time the take took to read). The take is read during this wait now.
+const TAKE_GAP_MS = 650
 const STALL_MS = 4000 // live packets stopped arriving this long: the recording is stuck; switch to takes
 
 let page = null
@@ -78,6 +79,7 @@ let hintShownAt = 0
 let phoneTimer = null
 let bleOneWayMs = 150 // half a phone round trip, measured below
 const PHONE_ASK_MS = 20000 // the relay follows the phone's player only while asked this often
+const PHONE_EARS_ASK_MS = 10000 // and while a switch is suspected, this often (each listen may cost Shazam 3 calls)
 
 function guard(name, fn) {
   return function () {
@@ -159,10 +161,10 @@ function startListening() {
       if (live !== probe) return
       mode = 'takes'
       diag.mode = 'takes'
-      lastStopAt = Date.now()
+      lastStopAt = take.stoppedAt || Date.now()
       live = null // its recorder is finished: the watch has only one
+      scheduleTake(lastStopAt + TAKE_GAP_MS - Date.now()) // (read while the mic may not restart yet)
       if (take.buffer && take.bytes) onTake(take)
-      if (mode === 'takes') scheduleTake(TAKE_GAP_MS)
     }),
     onError: guard('onLiveError', (code, message) => {
       diag.problem = code + (message ? ': ' + message : '')
@@ -184,10 +186,11 @@ function startListening() {
 // watch looks for a song, it asks the phone to listen too.
 function askPhone() {
   clearTimeout(phoneTimer)
-  phoneTimer = setTimeout(guard('askPhone', askPhone), PHONE_ASK_MS)
   const sentAt = Date.now()
+  const listen = session.wantsPhoneEars(s, sentAt)
+  phoneTimer = setTimeout(guard('askPhone', askPhone), session.suspecting(s, sentAt) ? PHONE_EARS_ASK_MS : PHONE_ASK_MS)
   page
-    .request({ method: 'phone', params: { listen: session.wantsPhoneEars(s) } }, { timeout: 8000 })
+    .request({ method: 'phone', params: { listen } }, { timeout: 8000 })
     .then(guard('phoneAnswer', (view) => {
       const trip = Date.now() - sentAt
       if (trip < 2000) bleOneWayMs = Math.round(bleOneWayMs * 0.7 + (trip / 2) * 0.3)
@@ -203,7 +206,11 @@ function onPhoneView(pv, trip) {
   const late = trip !== null ? trip / 2 : bleOneWayMs
   const v = Object.assign({}, pv)
   if (pv.playing) v.positionMs = pv.positionMs + late * (pv.speed || 1)
-  if (pv.heard && typeof pv.heard.positionMs === 'number') v.heard = Object.assign({}, pv.heard, { positionMs: pv.heard.positionMs + late })
+  if (pv.heard) {
+    v.heard = Object.assign({}, pv.heard)
+    if (typeof pv.heard.positionMs === 'number') v.heard.positionMs = pv.heard.positionMs + late
+    if (typeof pv.heard.startedAgoMs === 'number') v.heard.startedAgoMs = pv.heard.startedAgoMs + late
+  }
   session.onPhone(s, v, now)
   handleEvents()
   refresh()
@@ -232,7 +239,7 @@ function followSource() {
   mode = s.mode === 'takes' ? 'takes' : 'starting'
   diag.mode = mode
   if (mode === 'takes') {
-    if (!recording) scheduleTake(TAKE_GAP_MS)
+    if (!recording) scheduleTake(lastStopAt + TAKE_GAP_MS - Date.now())
     return
   }
   clearTimeout(takeTimer)
@@ -247,12 +254,10 @@ function scheduleTake(ms) {
   takeTimer = setTimeout(guard('take', takeNow), Math.max(0, ms))
 }
 
-// Long takes while looking (Shazam needs ~5 s); while following a song the server can
-// place, 3 s when the take will go to the server, else 2 s, so the music stopping is
-// heard soon after.
+// See session.takeKind.
 function takeMs() {
-  if (session.looking(s) || !s.song.fast || s.doubt) return FIND_TAKE_MS
-  return session.wantsAudio(s, Date.now()) ? PLACE_TAKE_MS : FOLLOW_TAKE_MS
+  const kind = session.takeKind(s, Date.now(), FOLLOW_TAKE_MS)
+  return kind === 'find' ? FIND_TAKE_MS : kind === 'place' ? PLACE_TAKE_MS : FOLLOW_TAKE_MS
 }
 
 function takeNow() {
@@ -268,7 +273,7 @@ function takeNow() {
     takeMs(),
     guard('recorded', (rec) => {
       recording = false
-      lastStopAt = Date.now()
+      lastStopAt = rec.stoppedAt || Date.now()
       if (rec.error) {
         diag.problem = rec.error
         refreshDebug()
@@ -281,8 +286,8 @@ function takeNow() {
       }
       if (takeFailures >= 3 && !s.song) view.showMessage('Listening…', 'Hold the watch near the music')
       takeFailures = 0
+      scheduleTake(lastStopAt + TAKE_GAP_MS - Date.now()) // (read while the mic may not restart yet)
       onTake(rec)
-      if (mode === 'takes') scheduleTake(TAKE_GAP_MS)
     }),
     (m) => logger.info(m),
   )
@@ -390,8 +395,13 @@ function onAnswer(req, res, roundTripMs) {
 
 function handleEvents() {
   const events = session.takeEvents(s)
+  let ears = false
   for (let i = 0; i < events.length; i++) {
     const e = events[i]
+    if (e.type === 'ears') {
+      ears = true // what plays may be another song: the phone's mic is asked now, not in 20 s
+      continue
+    }
     diag.lastEvent = e.type
     if (e.type === 'song') {
       view.forgetLayouts()
@@ -432,6 +442,7 @@ function handleEvents() {
     }
   }
   followSource()
+  if (ears) askPhone()
   if (events.length) {
     refresh()
     refreshDebug()

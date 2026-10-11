@@ -181,3 +181,24 @@ test('the phone paused in a loud room: its song stays up while the mics look, th
   assert.ok(!/Identifying|Listening/.test(screen), screen)
   assert.ok(/Wonderwall|Today is gonna be the day/.test(screen), screen)
 })
+
+test('a re-sync that no longer places the song asks the phone to listen at once, not at its next ask 20 s on', async (t) => {
+  const asks = []
+  let missedAt = 0
+  files.take = loudTake(54)
+  const FOUND = { ok: true, song: { id: 'wonderwall', title: 'Wonderwall', artist: 'Oasis', durationMs: 258_000 }, match: { offsetMs: 30_000, skew: 0, method: 'shazam' }, lyrics: SYNCED.lyrics, words: { status: 'ready' }, sync: { fast: true } }
+  await openPage(t, (method, params) => {
+    if (method === 'phone') {
+      asks.push({ at: Date.now(), listen: params.listen })
+      return phoneIdle()
+    }
+    if (method === 'lyrics') return Promise.resolve(SYNCED)
+    if (params.purpose === 'find') return Promise.resolve(FOUND)
+    if (!missedAt) missedAt = Date.now()
+    return Promise.resolve({ ok: false, reason: 'no_match' })
+  })
+  await run(30_000)
+  assert.ok(missedAt, 'a re-sync went out')
+  const next = asks.find((a) => a.at >= missedAt)
+  assert.ok(next && next.listen === true && next.at - missedAt < 1000, JSON.stringify({ missedAt, asks }))
+})

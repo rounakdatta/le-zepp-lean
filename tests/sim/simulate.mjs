@@ -12,8 +12,9 @@
 //   - the phone link: --ble-kbps of payload each way plus --base-ms per request.
 //   - or, with --takes, a recorder that only hands over a recording when it stops (a T-Rex 3
 //     on firmware 6.4.16.3): takes back to back, as page/home/index.js records them, each
-//     losing its first --take-start-ms to the mic starting, --take-gap-ms between one stop
-//     and the next start.
+//     losing its first --take-start-ms to the mic starting, handed over --settle-ms after
+//     stop() and read in --read-ms (its packets, then the request on its way); the next starts
+//     --take-gap-ms after stop(), or once the take is read if that is later.
 // The server is real: Shazam, the reference audio, fast re-sync and word timings.
 import { readFileSync } from 'node:fs'
 import * as session from '../../watch-app/lib/session.js'
@@ -34,8 +35,9 @@ const BASE_MS = Number(args['base-ms'] || 700)
 const T0 = 1_000_000 // watch time when recording starts
 const TAKES = args.takes !== undefined
 const TAKE_START_MS = Number(args['take-start-ms'] || 320)
-const SETTLE_MS = Number(args['settle-ms'] || 35) // the recorder's STOP event (~5 ms) + a 30 ms size check
-const TAKE_GAP_MS = SETTLE_MS + Number(args['take-gap-ms'] || 250) // stop -> next start
+const SETTLE_MS = Number(args['settle-ms'] || 105) // STOP (~5 ms), then the size read every 25 ms until it holds
+const READ_MS = Number(args['read-ms'] || 600) // T-Rex 3, 11 Oct 2026: 0.1-0.6 s for the packets, ~0.5 s more until the request left
+const TAKE_GAP_MS = Math.max(Number(args['take-gap-ms'] || 650), SETTLE_MS + READ_MS) // stop -> next start
 const LINE_LEAD = 300
 const WORD_LEAD = 40
 
@@ -124,8 +126,8 @@ function drain(now) {
 const total = packets.length
 // Takes mode: what page/home/index.js does with each finished take.
 function takeMs(now) {
-  if (session.looking(s) || !s.song.fast || s.doubt) return 3500
-  return session.wantsAudio(s, now) ? 3000 : 2000
+  const kind = session.takeKind(s, now, 2000)
+  return kind === 'find' ? 3500 : kind === 'place' ? 3000 : 2000
 }
 let takes = 0
 function startTake(start) {
@@ -133,10 +135,10 @@ function startTake(start) {
   const len = takeMs(start)
   const stop = start + len
   takes += 1
-  at(stop + SETTLE_MS, () => {
+  at(stop + SETTLE_MS + READ_MS, () => {
     const first = Math.max(0, Math.ceil((start + TAKE_START_MS - T0) / 60))
     const last = Math.min(total - 1, Math.floor((stop - T0) / 60) - 1)
-    const now = stop + SETTLE_MS
+    const now = stop + SETTLE_MS + READ_MS
     for (let i = first; i <= last; i++) {
       const level = silkLevel(packets[i], 0, packets[i].length)
       if (level) session.onPacket(s, i, level.gain, T0 + i * 60, now)

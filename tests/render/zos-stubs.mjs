@@ -42,14 +42,18 @@ export function BasePage(page) {
 }
 
 // @zos/media: one recorder, as on the watch. `overlaps` counts start() while it records.
-export const mic = { starts: 0, overlaps: 0, on: false }
+// `stopEventMs`: STOP fires this long after stop() (null: this firmware sends no events).
+export const mic = { starts: 0, overlaps: 0, on: false, stopEventMs: null, stoppedAt: 0 }
 export const id = { RECORDER: 'recorder' }
 export const codec = { OPUS: 'opus' }
 export function create() {
+  const listeners = {}
   return {
     event: { START: 'start', STOP: 'stop' },
     setFormat() {},
-    addEventListener() {},
+    addEventListener(type, fn) {
+      listeners[type] = fn
+    },
     start() {
       if (mic.on) mic.overlaps += 1
       mic.on = true
@@ -57,16 +61,23 @@ export function create() {
     },
     stop() {
       mic.on = false
+      mic.stoppedAt = Date.now()
+      if (mic.stopEventMs !== null && listeners.stop) setTimeout(listeners.stop, mic.stopEventMs)
     },
   }
 }
 
 // @zos/fs: a recording is `files.take` (null: it comes back empty), there only once the
-// recorder has stopped, as on a T-Rex 3
-export const files = { take: null }
+// recorder has stopped, as on a T-Rex 3; with `flushMs`, its last 30% written out over that
+// long after stop(), smoothly or (`flushStepMs`) in steps that far apart
+export const files = { take: null, flushMs: 0, flushStepMs: 0 }
 export const O_RDONLY = 0
 export function statSync() {
-  return { size: mic.on || !files.take ? 0 : files.take.byteLength }
+  if (mic.on || !files.take) return { size: 0 }
+  const since = Date.now() - mic.stoppedAt
+  if (since >= files.flushMs) return { size: files.take.byteLength }
+  const written = files.flushStepMs ? Math.floor(since / files.flushStepMs) * files.flushStepMs : since
+  return { size: Math.floor(files.take.byteLength * (0.7 + (0.3 * written) / files.flushMs)) }
 }
 export function readFileSync() {
   return mic.on ? null : files.take

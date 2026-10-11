@@ -65,6 +65,13 @@ export function pauseThreshold(a) {
   return f + 0.4 * (a.musicLevel - f)
 }
 
+// Sound worth asking Shazam about while looking for a song: clearly above the room's silence,
+// however far below the last song's level. A quiet intro (gain 20-21, after a song at 28-30)
+// was left unasked about for 25 s by the pause threshold (tests/sim, 11 Oct 2026).
+export function audibleThreshold(a) {
+  return floorKnown(a) ? floorOf(a) + 3 : pauseThreshold(a)
+}
+
 // The floor learns a noisy room by itself; noiseCeiling covers the moments before it has.
 // (A margin added on top of the learned floor counted the same noise twice, and then real
 // music at 32 could not get past a threshold of 33.)

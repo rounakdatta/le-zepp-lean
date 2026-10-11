@@ -59,6 +59,8 @@ def test_what_the_phone_hears_is_named_and_the_watch_gets_the_song_where_it_is_n
     # where the song is now: where the recording began, plus how long ago that was
     now_ms = time.time() * 1000
     assert abs(heard["positionMs"] - (30_000 + now_ms - started)) < 400
+    # and when the audio it is about began (news older than a pause is about the music before it)
+    assert abs(heard["startedAgoMs"] - (now_ms - started)) < 400 and "startedAt" not in heard
     assert len(asked) == 1
     assert stream(client, 1, started, first=5)[0]["done"], "named: the phone stops listening"
 
