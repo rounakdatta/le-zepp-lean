@@ -255,3 +255,13 @@ def test_the_kubelet_probe_needs_no_token_and_learns_nothing(api, monkeypatch):
     monkeypatch.setattr(app_module, "TOKEN", "s3cret")
     r = client.get("/livez")
     assert r.status_code == 200 and r.json() == {"ok": True}
+
+
+def test_the_address_in_a_browser_shows_what_this_is_and_nothing_else(api):
+    client, _, _ = api
+    page = client.get("/")
+    assert page.status_code == 200 and "LeZeppLean" in page.text and "/logo.png" in page.text
+    assert client.get("/logo.png").headers["content-type"] == "image/png"
+    assert client.get("/favicon.ico").headers["content-type"] == "image/png"
+    assert client.get("/docs").status_code == 404 and client.get("/openapi.json").status_code == 404
+    assert client.get("/recent").status_code in (200, 401)  # unchanged: the API is the API

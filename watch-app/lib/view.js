@@ -18,10 +18,12 @@ import { px } from '@zos/utils'
 import { layoutWords } from './layout.js'
 import { splitWords } from './sync.js'
 
-const ACCENT = 0x0986d4
-const LISTENING = 0xe0484b
+// The logo's colours (brand/logo-source.png): coral while a song plays, its cream while
+// listening for one, and the cream again for the word being sung.
+const ACCENT = 0xfe5641
+const LISTENING = 0xf8f4eb
 const PAUSED = 0x5a5a5a
-const SUNG = 0xffffff
+const SUNG = 0xf8f4eb
 const UNSUNG = 0x8a8a8a
 const PREV = 0x444444
 const NEXT = 0x6a6a6a
@@ -45,6 +47,8 @@ export function createView(options) {
   const ring = createWidget(widget.ARC, { ...ringBase, start_angle: -90, end_angle: -89, color: ACCENT })
 
   const title = text({ x: 95, y: 50, w: 290, h: 38, size: 26, color: 0xffffff, style: text_style.ELLIPSIS })
+  // The logo stands where the song's name will, until there is a song.
+  const logo = createWidget(widget.IMG, { x: px(192), y: px(30), src: 'logo-96.png' })
   const artist = text({ x: 70, y: 88, w: 340, h: 32, size: 22, color: 0x8a8a8a, style: text_style.ELLIPSIS })
   const prev = text({ x: 40, y: 128, w: 400, h: 58, size: 24, color: PREV, style: text_style.WRAP })
   const current = text({ ...CURRENT, size: 40, color: SUNG, style: text_style.WRAP })
@@ -176,6 +180,7 @@ export function createView(options) {
 
   return {
     showSong(song) {
+      logo.setProperty(prop.VISIBLE, false)
       set(title, song.title || '')
       set(artist, song.artist || '')
       set(prev, '')
@@ -238,7 +243,8 @@ export function createView(options) {
     },
 
     showMessage(main, sub) {
-      set(title, 'LeZeppLean')
+      logo.setProperty(prop.VISIBLE, true)
+      set(title, '')
       set(artist, '')
       set(prev, '')
       clearWords()

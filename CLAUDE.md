@@ -21,6 +21,7 @@ Platform research, with sources, is in `docs/research/` (start at `docs/research
 | `tools/` | `serve.sh` (server, tunnel and keep-awake), `install-watch.sh` (sign-in, build, install QR), `qr-hook.cjs` |
 | `charts/lezepplean/`, `.github/workflows/docker.yml` | The server's Helm chart and its CI (tests, then image + chart to GHCR), in texas-fold-em's shape |
 | `docs/research/` | Platform research (6 detailed reports plus a summary) |
+| `brand/`, `tools/brand.py` | The logo as drawn (`logo-source.png`) and everything made from it: the watch's round app icon and listening-screen mark, the Zepp settings header, the Android helper's adaptive icon, the server's page and favicon, the README's. Change the logo by replacing the source and running `uv run --no-project --with pillow --with numpy --with scipy python tools/brand.py`. Its colours (navy #0E1931→#03030A, cream #F8F4EB, coral #FE5641) are the watch's too: coral ring while a song plays, cream while listening and for the sung word |
 
 Keep `watch-app/` self-contained. `zeus build` compiles every `.js` file in it, and production builds embed every non-dot file into the uploaded package (`.ip-package`, which ignores `.gitignore`). That is why watch tests and tools live outside it. Local imports inside `watch-app/` carry the `.js` extension, so Node can load the same files the watch runs.
 

@@ -58,4 +58,6 @@ jobs:
           cp android/app/build/outputs/apk/release/app-release.apk "lezepplean-helper-$version.apk"
           gh release create "$GITHUB_REF_NAME" "lezepplean-helper-$version.apk" \
             --title "LeZeppLean helper $version" \
-            --notes "Install on the Android phone that plays the music, allow it to see what plays, paste the server token. See android/README.md."
+            --notes "<img src=\"https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/brand/logo-512.png\" width=\"96\" alt=\"LeZeppLean\">
+
+          Install on the Android phone that plays the music, allow it to see what plays, and paste the server token. The watch then follows the phone's player exactly, earphones or not."

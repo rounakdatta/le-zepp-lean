@@ -14,6 +14,7 @@ import android.util.TypedValue;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -54,7 +55,11 @@ public class MainActivity extends Activity {
         int pad = dp(24);
         col.setPadding(pad, pad, pad, pad);
 
-        col.addView(text("LeZeppLean", 28, true));
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.logo);
+        logo.setContentDescription("LeZeppLean");
+        col.addView(logo, new LinearLayout.LayoutParams(dp(72), dp(72)));
+        col.addView(text("LeZeppLean", 28, true), spaced(12));
         col.addView(text("Lyrics on your watch for what this phone plays: Spotify, YouTube Music, YouTube, any player. "
                 + "Exactly in time, earphones or not.", 15, false), spaced(8));
 

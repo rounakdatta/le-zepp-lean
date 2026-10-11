@@ -43,6 +43,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from . import __version__, phone, roman, track, zepp_opus
@@ -104,7 +105,37 @@ async def lifespan(_app):
     _preparer.close()
 
 
-app = FastAPI(title="LeZeppLean", version=__version__, lifespan=lifespan)
+# No /docs or /openapi.json: the API is for the watch's relay, and the page at / says what this is.
+app = FastAPI(title="LeZeppLean", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+STATIC = Path(__file__).resolve().parent / "static"
+HOME = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0E1931">
+<title>LeZeppLean</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+  html { background: #03030A; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; text-align: center;
+         background: linear-gradient(#0E1931, #03030A); color: #F8F4EB;
+         font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { padding: 48px 24px; max-width: 30rem; }
+  img { width: 128px; height: 128px; }
+  h1 { font-size: 28px; margin: 20px 0 6px; letter-spacing: 0.01em; }
+  p { margin: 0; color: #B9B3A8; }
+  a { color: #FE5641; text-decoration: none; }
+  a:hover, a:focus-visible { text-decoration: underline; }
+  .more { margin-top: 28px; font-size: 15px; }
+</style>
+<main>
+  <img src="/logo.png" alt="">
+  <h1>LeZeppLean</h1>
+  <p>Lyrics on your wrist, word by word, in time with the music around you or in your earphones.</p>
+  <p class="more"><a href="https://github.com/rounakdatta/le-zepp-lean">github.com/rounakdatta/le-zepp-lean</a></p>
+</main>
+</html>
+"""
 
 
 class IdentifyRequest(BaseModel):
@@ -361,6 +392,23 @@ def _locate(song: Song, pcm: bytes, expect_ms: float | None, may_jump: bool) -> 
         return None
     return {"offsetMs": round(m.to_canonical(found.offset_ms), 1), "skew": m.b, "method": method,
             "score": round(found.score, 3), "margin": round(found.margin, 3)}
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def home() -> str:
+    """What this is, for anyone who opens the address in a browser."""
+    return HOME
+
+
+@app.get("/logo.png", include_in_schema=False)
+async def logo() -> FileResponse:
+    return FileResponse(STATIC / "logo.png", media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/favicon.png", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(STATIC / "favicon.png", media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/livez")
