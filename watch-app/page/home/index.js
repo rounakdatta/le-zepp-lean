@@ -136,11 +136,11 @@ Page(
 // ---- listening ------------------------------------------------------------------
 
 function startListening() {
-  live = startLive({
+  const probe = (live = startLive({
     onLive: guard('onLive', () => {
       mode = 'live'
       diag.mode = 'live'
-      diag.firstGrowthMs = live.firstGrowthMs
+      diag.firstGrowthMs = probe.firstGrowthMs
       refreshDebug()
     }),
     onPacket: guard('onPacket', (index, gain) => {
@@ -150,15 +150,14 @@ function startListening() {
       afterSession(req, now)
     }),
     onTake: guard('onTake', (take) => {
-      if (mode === 'phone') {
-        live = null // the phone took over while this was recording
-        return
-      }
-      // This firmware writes the file only at stop(): carry on with separate takes.
+      // This firmware writes the file only at stop(): it records in separate takes.
+      s.mode = 'takes'
+      diag.probe = take.probe
+      // Let go of meanwhile (the phone took over, and may have let go, with another probe
+      // started since): the recorder is someone else's now.
+      if (live !== probe) return
       mode = 'takes'
       diag.mode = 'takes'
-      diag.probe = take.probe
-      s.mode = 'takes'
       lastStopAt = Date.now()
       live = null // its recorder is finished: the watch has only one
       if (take.buffer && take.bytes) onTake(take)
@@ -174,7 +173,7 @@ function startListening() {
       }
       refreshDebug()
     }),
-  })
+  }))
 }
 
 // ---- the phone's own player ---------------------------------------------------------

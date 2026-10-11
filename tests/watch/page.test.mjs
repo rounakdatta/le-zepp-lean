@@ -97,3 +97,14 @@ test('leaving earphones mode never starts the mic over a take still recording', 
   assert.equal(mic.overlaps, 0, 'the one recorder was never started twice')
   assert.ok(mic.starts >= 3, 'and the takes carry on')
 })
+
+test('the phone taking over and letting go while the opening probe winds down never starts the mic twice', async (t) => {
+  const page = await openPage(t, (method) => (method === 'lyrics' ? Promise.resolve(SYNCED) : phoneIdle()))
+  await run(4700) // the probe has given up on reading while recording, and waits for its file to settle
+  page.onCall({ method: 'phone', params: { ...SONG, version: 4, playing: true, positionMs: 1000 } })
+  await run(500)
+  page.onCall({ method: 'phone', params: { version: 5, title: '', playing: false, positionMs: 0 } }) // the player closed
+  await run(12_000)
+  assert.equal(mic.overlaps, 0, 'the one recorder was never started twice')
+  assert.ok(mic.on || mic.starts >= 3, 'and listening carries on')
+})
